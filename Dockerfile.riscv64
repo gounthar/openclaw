@@ -1,4 +1,4 @@
-FROM gounthar/node-riscv64:22.22.0-trixie
+FROM gounthar/node-riscv64:22.22.0-trixie@sha256:283d2e2f9db8e777aa51e5745eeee18e3396a8ac01131cfad94e4d9ddf46f97b
 
 # Bun has no riscv64 binary; skip installation and use pnpm throughout
 RUN mkdir -p /root/.bun/bin
