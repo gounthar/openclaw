@@ -54,7 +54,7 @@ jobs:
             if ! git ls-remote --tags origin "refs/tags/$tag" | grep -qF "$tag"; then
               new_tags+=("$tag")
             fi
-          done < <(git tag -l 'v*' --sort=-version:refname | head -20)
+          done < <(git tag -l 'v*' --sort=-version:refname)
 
           if [ ${#new_tags[@]} -eq 0 ]; then
             echo "No new upstream tags to mirror"
