@@ -1,0 +1,159 @@
+name: RISC-V Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (e.g. v2026.2.23)'
+        required: true
+        type: string
+
+concurrency:
+  group: riscv64-release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-riscv64:
+    name: Build riscv64 Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.value }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.value }}"
+          version="${version#v}"
+          tags=("${IMAGE}:${version}-riscv64" "${IMAGE}:riscv64")
+          {
+            echo "value<<EOF"
+            printf "%s\n" "${tags[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push riscv64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/riscv64
+          tags: ${{ steps.tags.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          push: true
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: [build-riscv64]
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          version="${{ needs.build-riscv64.outputs.version }}"
+          echo "tag=${version}" >> "$GITHUB_OUTPUT"
+          echo "name=${version#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release exists
+        id: check
+        shell: bash
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}-riscv64" --repo "${{ github.repository }}" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Delete existing release
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          gh release delete "${{ steps.version.outputs.tag }}-riscv64" \
+            --repo "${{ github.repository }}" --yes --cleanup-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create release
+        shell: bash
+        run: |
+          cat > notes.md << 'NOTES'
+          ## RISC-V Docker Image
+
+          Automated RISC-V (riscv64) build tracking upstream release.
+
+          ### Docker
+          ```bash
+          docker pull ghcr.io/${{ github.repository }}:${{ steps.version.outputs.name }}-riscv64
+          ```
+
+          ### Upstream
+          - **Release**: [${{ steps.version.outputs.tag }}](https://github.com/openclaw/openclaw/releases/tag/${{ steps.version.outputs.tag }})
+          NOTES
+
+          gh release create "${{ steps.version.outputs.tag }}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "RISC-V ${{ steps.version.outputs.name }}" \
+            --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## RISC-V Release"
+            echo ""
+            echo "**Version**: ${{ steps.version.outputs.name }}"
+            echo "**Image**: \`ghcr.io/${{ github.repository }}:${{ steps.version.outputs.name }}-riscv64\`"
+            echo "**Digest**: \`${{ needs.build-riscv64.outputs.image-digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
