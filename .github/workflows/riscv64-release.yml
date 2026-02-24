@@ -34,9 +34,11 @@ jobs:
       - name: Resolve version
         id: version
         shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "value=$INPUT_TAG" >> "$GITHUB_OUTPUT"
           else
             echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
@@ -66,10 +68,10 @@ jobs:
         shell: bash
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.value }}"
-          version="${version#v}"
+          version="${VERSION#v}"
           tags=("${IMAGE}:${version}-riscv64" "${IMAGE}:riscv64")
           {
             echo "value<<EOF"
@@ -99,61 +101,70 @@ jobs:
       - name: Resolve version
         id: version
         shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.build-riscv64.outputs.version }}
         run: |
-          version="${{ needs.build-riscv64.outputs.version }}"
-          echo "tag=${version}" >> "$GITHUB_OUTPUT"
-          echo "name=${version#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${BUILD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "name=${BUILD_VERSION#v}" >> "$GITHUB_OUTPUT"
 
       - name: Check if release exists
         id: check
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}-riscv64
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${{ steps.version.outputs.tag }}-riscv64" --repo "${{ github.repository }}" &>/dev/null; then
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Delete existing release
         if: steps.check.outputs.exists == 'true'
-        run: |
-          gh release delete "${{ steps.version.outputs.tag }}-riscv64" \
-            --repo "${{ github.repository }}" --yes --cleanup-tag
         env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}-riscv64
           GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" --yes --cleanup-tag
 
       - name: Create release
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}-riscv64
+          RELEASE_NAME: ${{ steps.version.outputs.name }}
+          UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cat > notes.md << 'NOTES'
+          cat > notes.md << NOTES
           ## RISC-V Docker Image
 
           Automated RISC-V (riscv64) build tracking upstream release.
 
           ### Docker
-          ```bash
-          docker pull ghcr.io/${{ github.repository }}:${{ steps.version.outputs.name }}-riscv64
-          ```
+          \`\`\`bash
+          docker pull ghcr.io/${{ github.repository }}:${RELEASE_NAME}-riscv64
+          \`\`\`
 
           ### Upstream
-          - **Release**: [${{ steps.version.outputs.tag }}](https://github.com/openclaw/openclaw/releases/tag/${{ steps.version.outputs.tag }})
+          - **Release**: [${UPSTREAM_TAG}](https://github.com/openclaw/openclaw/releases/tag/${UPSTREAM_TAG})
           NOTES
 
-          gh release create "${{ steps.version.outputs.tag }}-riscv64" \
+          gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
-            --title "RISC-V ${{ steps.version.outputs.name }}" \
+            --title "RISC-V ${RELEASE_NAME}" \
             --notes-file notes.md
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Summary
+        env:
+          RELEASE_NAME: ${{ steps.version.outputs.name }}
+          IMAGE_DIGEST: ${{ needs.build-riscv64.outputs.image-digest }}
         run: |
           {
             echo "## RISC-V Release"
             echo ""
-            echo "**Version**: ${{ steps.version.outputs.name }}"
-            echo "**Image**: \`ghcr.io/${{ github.repository }}:${{ steps.version.outputs.name }}-riscv64\`"
-            echo "**Digest**: \`${{ needs.build-riscv64.outputs.image-digest }}\`"
+            echo "**Version**: ${RELEASE_NAME}"
+            echo "**Image**: \`ghcr.io/${{ github.repository }}:${RELEASE_NAME}-riscv64\`"
+            echo "**Digest**: \`${IMAGE_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"

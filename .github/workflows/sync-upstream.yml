@@ -18,7 +18,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # PAT required so that tag pushes trigger downstream workflows
+          # (pushes with GITHUB_TOKEN do not trigger other workflows)
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Configure git
         run: |
@@ -49,7 +51,7 @@ jobs:
           new_tags=()
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
-            if ! git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
+            if ! git ls-remote --tags origin "refs/tags/$tag" | grep -qF "$tag"; then
               new_tags+=("$tag")
             fi
           done < <(git tag -l 'v*' --sort=-version:refname | head -20)
