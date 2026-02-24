@@ -7,6 +7,14 @@ RUN mkdir -p /root/.bun/bin && \
     chmod +x /root/.bun/bin/bun
 ENV PATH="/root/.bun/bin:${PATH}"
 
+# node-llama-cpp postinstall compiles llama.cpp from source on riscv64
+# (no prebuilt binaries or cmake download available for this arch)
+RUN apt-get update -o Acquire::Retries=3 && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      cmake g++ make && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
 RUN corepack enable
 
 WORKDIR /app
