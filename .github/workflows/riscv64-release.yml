@@ -153,6 +153,7 @@ jobs:
 
           gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
+            --target "${{ steps.version.outputs.tag }}" \
             --title "RISC-V ${RELEASE_NAME}" \
             --notes-file notes.md
 
