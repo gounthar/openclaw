@@ -12,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: riscv64-release-${{ github.ref_name }}
+  group: riscv64-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -88,6 +88,8 @@ jobs:
           tags: ${{ steps.tags.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Disabled to avoid cross-platform manifest-list issues with GHCR;
+          # revisit when buildx multi-platform provenance is stable for riscv64
           provenance: false
           push: true
 
@@ -106,6 +108,19 @@ jobs:
         run: |
           echo "tag=${BUILD_VERSION}" >> "$GITHUB_OUTPUT"
           echo "name=${BUILD_VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Resolve target commit
+        id: target
+        shell: bash
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Check if release exists
         id: check
@@ -135,6 +150,7 @@ jobs:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}-riscv64
           RELEASE_NAME: ${{ steps.version.outputs.name }}
           UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > notes.md << NOTES
@@ -154,6 +170,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --title "RISC-V ${RELEASE_NAME}" \
+            --target "$TARGET_SHA" \
             --notes-file notes.md
 
       - name: Summary
