@@ -1,0 +1,71 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run every 6 hours to stay close to upstream release cadence
+    - cron: '15 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync fork with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # PAT required so that tag pushes trigger downstream workflows
+          # (pushes with GITHUB_TOKEN do not trigger other workflows)
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/openclaw/openclaw.git
+
+      - name: Fetch upstream
+        run: git fetch upstream --tags
+
+      - name: Fast-forward main
+        run: |
+          git checkout main
+          if git merge-base --is-ancestor main upstream/main; then
+            git merge --ff-only upstream/main
+            git push origin main
+            echo "main branch synced with upstream"
+          else
+            echo "::warning::Fork main has diverged from upstream — skipping sync"
+            exit 0
+          fi
+
+      - name: Mirror new release tags
+        run: |
+          # Get tags present in upstream but not in origin
+          new_tags=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            if ! git ls-remote --tags origin "refs/tags/$tag" | grep -qF "$tag"; then
+              new_tags+=("$tag")
+            fi
+          # Cap to recent tags to avoid mirroring entire history on first run;
+          # upstream releases daily so 50 covers ~2 months of catch-up
+          done < <(git tag -l 'v*' --sort=-version:refname | head -50)
+
+          if [ ${#new_tags[@]} -eq 0 ]; then
+            echo "No new upstream tags to mirror"
+            exit 0
+          fi
+
+          echo "Mirroring ${#new_tags[@]} new tag(s):"
+          printf "  %s\n" "${new_tags[@]}"
+
+          for tag in "${new_tags[@]}"; do
+            git push origin "refs/tags/$tag"
+          done
