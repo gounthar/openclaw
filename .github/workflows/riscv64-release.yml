@@ -43,10 +43,21 @@ jobs:
             echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout
+      - name: Checkout upstream tag
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.version.outputs.value }}
+
+      - name: Overlay Dockerfile.riscv64 from fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: Dockerfile.riscv64
+          sparse-checkout-cone-mode: false
+          path: _fork
+
+      - name: Copy Dockerfile.riscv64 into workspace
+        run: cp _fork/Dockerfile.riscv64 . && rm -rf _fork
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
