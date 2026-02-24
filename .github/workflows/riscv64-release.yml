@@ -84,6 +84,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.riscv64
           platforms: linux/riscv64
           tags: ${{ steps.tags.outputs.value }}
           cache-from: type=gha
