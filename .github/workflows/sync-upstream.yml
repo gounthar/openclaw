@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   sync:
@@ -69,3 +70,26 @@ jobs:
           for tag in "${new_tags[@]}"; do
             git push origin "refs/tags/$tag"
           done
+
+          # Export release tags (non-beta, non-rc) for the dispatch step
+          release_tags=()
+          for tag in "${new_tags[@]}"; do
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              release_tags+=("$tag")
+            fi
+          done
+          if [ ${#release_tags[@]} -gt 0 ]; then
+            # Use the latest release tag
+            latest="${release_tags[0]}"
+            echo "latest_release_tag=$latest" >> "$GITHUB_OUTPUT"
+            echo "Triggering riscv64 build for $latest"
+          fi
+        id: mirror
+
+      - name: Trigger riscv64 build
+        if: steps.mirror.outputs.latest_release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          gh workflow run riscv64-release.yml \
+            -f tag="${{ steps.mirror.outputs.latest_release_tag }}"
