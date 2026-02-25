@@ -30,7 +30,6 @@ jobs:
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.version.outputs.value }}
-      dockerhub-image: ${{ steps.tags.outputs.dockerhub_image }}
     steps:
       - name: Resolve version
         id: version
@@ -102,8 +101,6 @@ jobs:
             printf "%s\n" "${tags[@]}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          # Export the Docker Hub image (without docker.io/ prefix) for release notes
-          echo "dockerhub_image=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push riscv64 image
         id: build
@@ -178,7 +175,7 @@ jobs:
           RELEASE_NAME: ${{ steps.version.outputs.name }}
           UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
-          DOCKERHUB_IMAGE: ${{ needs.build-riscv64.outputs.dockerhub-image }}
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > notes.md << NOTES
@@ -210,7 +207,7 @@ jobs:
         env:
           RELEASE_NAME: ${{ steps.version.outputs.name }}
           IMAGE_DIGEST: ${{ needs.build-riscv64.outputs.image-digest }}
-          DOCKERHUB_IMAGE: ${{ needs.build-riscv64.outputs.dockerhub-image }}
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
         run: |
           {
             echo "## RISC-V Release"
