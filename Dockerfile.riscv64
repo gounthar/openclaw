@@ -1,14 +1,35 @@
+# riscv64-specific Dockerfile
+#
+# Build tools (tsdown/rolldown) have no riscv64 native binaries, so
+# TypeScript compilation runs on the build host's native architecture.
+# The output is pure JS and architecture-independent.
+
+# ── Stage 1: build on host arch ─────────────────────────────────────
+FROM --platform=$BUILDPLATFORM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935 AS builder
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+RUN corepack enable
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY ui/package.json ./ui/package.json
+COPY patches ./patches
+COPY scripts ./scripts
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:build
+
+# ── Stage 2: runtime on riscv64 ─────────────────────────────────────
 FROM gounthar/node-riscv64:22.22.0-trixie@sha256:283d2e2f9db8e777aa51e5745eeee18e3396a8ac01131cfad94e4d9ddf46f97b
 
-# Bun has no riscv64 binary; provide a stub for PATH compatibility and use pnpm throughout.
-# If any build script attempts to invoke bun, the stub will fail explicitly.
-RUN mkdir -p /root/.bun/bin && \
-    printf '%s\n' '#!/bin/sh' 'echo "bun is not available on riscv64" >&2' 'exit 1' > /root/.bun/bin/bun && \
-    chmod +x /root/.bun/bin/bun
-ENV PATH="/root/.bun/bin:${PATH}"
+# Bun has no riscv64 binary; provide a stub so scripts that check for
+# bun in PATH get an explicit error instead of a silent fallback.
+# Placed in /usr/local/bin so it is accessible to all users (including node).
+RUN printf '%s\n' '#!/bin/sh' 'echo "bun is not available on riscv64" >&2' 'exit 1' > /usr/local/bin/bun && \
+    chmod +x /usr/local/bin/bun
 
-# node-llama-cpp postinstall compiles llama.cpp from source on riscv64
-# (no prebuilt binaries or cmake download available for this arch)
+# node-llama-cpp compiles llama.cpp from source on riscv64
 RUN apt-get update -o Acquire::Retries=3 && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       cmake g++ make && \
@@ -36,19 +57,21 @@ COPY --chown=node:node scripts ./scripts
 USER node
 RUN pnpm install --frozen-lockfile
 
-# Browser automation (OPENCLAW_INSTALL_BROWSER) is not supported on riscv64
-# because Playwright does not ship Chromium binaries for this architecture.
+# Browser automation is not supported on riscv64
+# (Playwright has no Chromium binaries for this architecture)
 
 COPY --chown=node:node . .
-RUN pnpm build
-ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:build
 
+# Copy pre-built JS artifacts from the cross-compile stage.
+# dist/ contains all tsdown output plus the a2ui bundle copy.
+# src/canvas-host/a2ui/ is copied in full (bundle + index.html + hash).
+COPY --from=builder --chown=node:node /app/dist ./dist
+COPY --from=builder --chown=node:node /app/src/canvas-host/a2ui/ ./src/canvas-host/a2ui/
+
+ENV OPENCLAW_PREFER_PNPM=1
 ENV NODE_ENV=production
 
 # Security hardening: Run as non-root user
-# The base image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
 USER node
 
 # Start gateway server with default config.
