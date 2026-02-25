@@ -30,6 +30,7 @@ jobs:
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.version.outputs.value }}
+      dockerhub-image: ${{ steps.tags.outputs.dockerhub_image }}
     steps:
       - name: Resolve version
         id: version
@@ -85,7 +86,7 @@ jobs:
         shell: bash
         env:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          DOCKERHUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/openclaw
+          DOCKERHUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
@@ -101,6 +102,8 @@ jobs:
             printf "%s\n" "${tags[@]}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+          # Export the Docker Hub image (without docker.io/ prefix) for release notes
+          echo "dockerhub_image=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push riscv64 image
         id: build
@@ -175,6 +178,7 @@ jobs:
           RELEASE_NAME: ${{ steps.version.outputs.name }}
           UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
+          DOCKERHUB_IMAGE: ${{ needs.build-riscv64.outputs.dockerhub-image }}
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > notes.md << NOTES
@@ -184,7 +188,7 @@ jobs:
 
           ### Docker Hub
           \`\`\`bash
-          docker pull gounthar/openclaw:${RELEASE_NAME}-riscv64
+          docker pull ${DOCKERHUB_IMAGE}:${RELEASE_NAME}-riscv64
           \`\`\`
 
           ### GitHub Container Registry
@@ -206,12 +210,13 @@ jobs:
         env:
           RELEASE_NAME: ${{ steps.version.outputs.name }}
           IMAGE_DIGEST: ${{ needs.build-riscv64.outputs.image-digest }}
+          DOCKERHUB_IMAGE: ${{ needs.build-riscv64.outputs.dockerhub-image }}
         run: |
           {
             echo "## RISC-V Release"
             echo ""
             echo "**Version**: ${RELEASE_NAME}"
             echo "**GHCR**: \`ghcr.io/${{ github.repository }}:${RELEASE_NAME}-riscv64\`"
-            echo "**Docker Hub**: \`gounthar/openclaw:${RELEASE_NAME}-riscv64\`"
+            echo "**Docker Hub**: \`${DOCKERHUB_IMAGE}:${RELEASE_NAME}-riscv64\`"
             echo "**Digest**: \`${IMAGE_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
