@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   sync:
@@ -79,8 +78,8 @@ jobs:
             fi
           done
           if [ ${#release_tags[@]} -gt 0 ]; then
-            # Use the latest release tag
-            latest="${release_tags[0]}"
+            # Explicitly select highest version (don't rely on input ordering)
+            latest="$(printf '%s\n' "${release_tags[@]}" | sort -V | tail -n1)"
             echo "latest_release_tag=$latest" >> "$GITHUB_OUTPUT"
             echo "Triggering riscv64 build for $latest"
           fi
