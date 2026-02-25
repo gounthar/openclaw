@@ -142,6 +142,7 @@ describe("abort detection", () => {
       "stop dont do anything",
       "stop do not do anything",
       "stop doing anything",
+      "do not do that",
       "please stop",
       "stop please",
       "STOP OPENCLAW",
@@ -172,15 +173,19 @@ describe("abort detection", () => {
     }
 
     expect(isAbortTrigger("hello")).toBe(false);
-    expect(isAbortTrigger("do not do that")).toBe(false);
+    expect(isAbortTrigger("please do not do that")).toBe(false);
     // /stop is NOT matched by isAbortTrigger - it's handled separately.
     expect(isAbortTrigger("/stop")).toBe(false);
   });
 
   it("isAbortRequestText aligns abort command semantics", () => {
     expect(isAbortRequestText("/stop")).toBe(true);
+    expect(isAbortRequestText("/STOP")).toBe(true);
     expect(isAbortRequestText("/stop!!!")).toBe(true);
+    expect(isAbortRequestText("/Stop!!!")).toBe(true);
     expect(isAbortRequestText("stop")).toBe(true);
+    expect(isAbortRequestText("Stop")).toBe(true);
+    expect(isAbortRequestText("STOP")).toBe(true);
     expect(isAbortRequestText("stop action")).toBe(true);
     expect(isAbortRequestText("stop openclaw!!!")).toBe(true);
     expect(isAbortRequestText("やめて")).toBe(true);
@@ -190,9 +195,11 @@ describe("abort detection", () => {
     expect(isAbortRequestText("pare")).toBe(true);
     expect(isAbortRequestText(" توقف ")).toBe(true);
     expect(isAbortRequestText("/stop@openclaw_bot", { botUsername: "openclaw_bot" })).toBe(true);
+    expect(isAbortRequestText("/Stop@openclaw_bot", { botUsername: "openclaw_bot" })).toBe(true);
 
     expect(isAbortRequestText("/status")).toBe(false);
-    expect(isAbortRequestText("do not do that")).toBe(false);
+    expect(isAbortRequestText("do not do that")).toBe(true);
+    expect(isAbortRequestText("please do not do that")).toBe(false);
     expect(isAbortRequestText("/abort")).toBe(false);
   });
 
