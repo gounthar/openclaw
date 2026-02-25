@@ -23,11 +23,11 @@ RUN pnpm ui:build
 # ── Stage 2: runtime on riscv64 ─────────────────────────────────────
 FROM gounthar/node-riscv64:22.22.0-trixie@sha256:283d2e2f9db8e777aa51e5745eeee18e3396a8ac01131cfad94e4d9ddf46f97b
 
-# Bun has no riscv64 binary; provide a stub for PATH compatibility.
-RUN mkdir -p /root/.bun/bin && \
-    printf '%s\n' '#!/bin/sh' 'echo "bun is not available on riscv64" >&2' 'exit 1' > /root/.bun/bin/bun && \
-    chmod +x /root/.bun/bin/bun
-ENV PATH="/root/.bun/bin:${PATH}"
+# Bun has no riscv64 binary; provide a stub so scripts that check for
+# bun in PATH get an explicit error instead of a silent fallback.
+# Placed in /usr/local/bin so it is accessible to all users (including node).
+RUN printf '%s\n' '#!/bin/sh' 'echo "bun is not available on riscv64" >&2' 'exit 1' > /usr/local/bin/bun && \
+    chmod +x /usr/local/bin/bun
 
 # node-llama-cpp compiles llama.cpp from source on riscv64
 RUN apt-get update -o Acquire::Retries=3 && \
@@ -62,9 +62,11 @@ RUN pnpm install --frozen-lockfile
 
 COPY --chown=node:node . .
 
-# Copy pre-built JS artifacts from the cross-compile stage
+# Copy pre-built JS artifacts from the cross-compile stage.
+# dist/ contains all tsdown output plus the a2ui bundle copy.
+# src/canvas-host/a2ui/ is copied in full (bundle + index.html + hash).
 COPY --from=builder --chown=node:node /app/dist ./dist
-COPY --from=builder --chown=node:node /app/src/canvas-host/a2ui/a2ui.bundle.js ./src/canvas-host/a2ui/a2ui.bundle.js
+COPY --from=builder --chown=node:node /app/src/canvas-host/a2ui/ ./src/canvas-host/a2ui/
 
 ENV OPENCLAW_PREFER_PNPM=1
 ENV NODE_ENV=production
