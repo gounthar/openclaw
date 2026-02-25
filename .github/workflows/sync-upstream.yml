@@ -69,3 +69,24 @@ jobs:
           for tag in "${new_tags[@]}"; do
             git push origin "refs/tags/$tag"
           done
+
+          # Trigger riscv64 build for each new stable release tag
+          release_tags=()
+          for tag in "${new_tags[@]}"; do
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              release_tags+=("$tag")
+            fi
+          done
+          if [ ${#release_tags[@]} -eq 0 ]; then
+            echo "No new stable release tags to build"
+            exit 0
+          fi
+          # Sort for consistent ordering in logs
+          sorted_tags=($(printf '%s\n' "${release_tags[@]}" | sort -V))
+          echo "Dispatching riscv64 build for ${#sorted_tags[@]} tag(s):"
+          for tag in "${sorted_tags[@]}"; do
+            echo "  Triggering riscv64 build for $tag"
+            gh workflow run riscv64-release.yml -f tag="$tag"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
