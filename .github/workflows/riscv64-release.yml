@@ -151,7 +151,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}-riscv64
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -163,7 +163,7 @@ jobs:
         if: steps.check.outputs.exists == 'true'
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}-riscv64
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           gh release delete "$RELEASE_TAG" \
             --repo "${{ github.repository }}" --yes --cleanup-tag
@@ -176,7 +176,7 @@ jobs:
           UPSTREAM_TAG: ${{ steps.version.outputs.tag }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           cat > notes.md << NOTES
           ## RISC-V Docker Image
