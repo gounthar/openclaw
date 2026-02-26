@@ -86,7 +86,7 @@ jobs:
           echo "Dispatching riscv64 build for ${#sorted_tags[@]} tag(s):"
           for tag in "${sorted_tags[@]}"; do
             echo "  Triggering riscv64 build for $tag"
-            gh workflow run riscv64-release.yml -f tag="$tag"
+            gh workflow run riscv64-release.yml -R "$GITHUB_REPOSITORY" -f tag="$tag"
           done
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
