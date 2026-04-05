@@ -82,6 +82,12 @@ After it finishes:
 - Paste the token into the Control UI (Settings → token).
 - Need the URL again? Run `docker compose run --rm openclaw-cli dashboard --no-open`.
 
+  <Step title="Open the Control UI">
+    Open `http://127.0.0.1:18789/` in your browser and paste the configured
+    shared secret into Settings. The setup script writes a token to `.env` by
+    default; if you switch the container config to password auth, use that
+    password instead.
+
 ### Enable agent sandbox for Docker gateway (opt-in)
 
 `docker-setup.sh` can also bootstrap `agents.defaults.sandbox.*` for Docker
@@ -884,11 +890,58 @@ on typical riscv64 hardware.
 
 ## Troubleshooting
 
-- Image missing: build with [`scripts/sandbox-setup.sh`](https://github.com/openclaw/openclaw/blob/main/scripts/sandbox-setup.sh) or set `agents.defaults.sandbox.docker.image`.
-- Container not running: it will auto-create per session on demand.
-- Permission errors in sandbox: set `docker.user` to a UID:GID that matches your
-  mounted workspace ownership (or chown the workspace folder).
-- Custom tools not found: OpenClaw runs commands with `sh -lc` (login shell), which
-  sources `/etc/profile` and may reset PATH. Set `docker.env.PATH` to prepend your
-  custom tool paths (e.g., `/custom/bin:/usr/local/share/npm-global/bin`), or add
-  a script under `/etc/profile.d/` in your Dockerfile.
+<AccordionGroup>
+  <Accordion title="Image missing or sandbox container not starting">
+    Build the sandbox image with
+    [`scripts/sandbox-setup.sh`](https://github.com/openclaw/openclaw/blob/main/scripts/sandbox-setup.sh)
+    or set `agents.defaults.sandbox.docker.image` to your custom image.
+    Containers are auto-created per session on demand.
+  </Accordion>
+
+  <Accordion title="Permission errors in sandbox">
+    Set `docker.user` to a UID:GID that matches your mounted workspace ownership,
+    or chown the workspace folder.
+  </Accordion>
+
+  <Accordion title="Custom tools not found in sandbox">
+    OpenClaw runs commands with `sh -lc` (login shell), which sources
+    `/etc/profile` and may reset PATH. Set `docker.env.PATH` to prepend your
+    custom tool paths, or add a script under `/etc/profile.d/` in your Dockerfile.
+  </Accordion>
+
+  <Accordion title="OOM-killed during image build (exit 137)">
+    The VM needs at least 2 GB RAM. Use a larger machine class and retry.
+  </Accordion>
+
+  <Accordion title="Unauthorized or pairing required in Control UI">
+    Fetch a fresh dashboard link and approve the browser device:
+
+    ```bash
+    docker compose run --rm openclaw-cli dashboard --no-open
+    docker compose run --rm openclaw-cli devices list
+    docker compose run --rm openclaw-cli devices approve <requestId>
+    ```
+
+    More detail: [Dashboard](/web/dashboard), [Devices](/cli/devices).
+
+  </Accordion>
+
+  <Accordion title="Gateway target shows ws://172.x.x.x or pairing errors from Docker CLI">
+    Reset gateway mode and bind:
+
+    ```bash
+    docker compose run --rm openclaw-cli config set gateway.mode local
+    docker compose run --rm openclaw-cli config set gateway.bind lan
+    docker compose run --rm openclaw-cli devices list --url ws://127.0.0.1:18789
+    ```
+
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+- [Install Overview](/install) — all installation methods
+- [Podman](/install/podman) — Podman alternative to Docker
+- [ClawDock](/install/clawdock) — Docker Compose community setup
+- [Updating](/install/updating) — keeping OpenClaw up to date
+- [Configuration](/gateway/configuration) — gateway configuration after install

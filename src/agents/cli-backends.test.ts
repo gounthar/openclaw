@@ -3,7 +3,7 @@ import type { OpenClawConfig } from "../config/config.js";
 import type { CliBackendConfig } from "../config/types.js";
 import { createEmptyPluginRegistry } from "../plugins/registry.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { resolveCliBackendConfig } from "./cli-backends.js";
+import { normalizeClaudeBackendConfig, resolveCliBackendConfig } from "./cli-backends.js";
 
 function createBackendEntry(params: {
   pluginId: string;
@@ -32,9 +32,16 @@ beforeEach(() => {
       id: "claude-cli",
       config: {
         command: "claude",
-        args: ["stream-json", "--verbose", "--permission-mode", "bypassPermissions"],
+        args: [
+          "stream-json",
+          "--include-partial-messages",
+          "--verbose",
+          "--permission-mode",
+          "bypassPermissions",
+        ],
         resumeArgs: [
           "stream-json",
+          "--include-partial-messages",
           "--verbose",
           "--permission-mode",
           "bypassPermissions",
@@ -42,25 +49,9 @@ beforeEach(() => {
           "{sessionId}",
         ],
         output: "jsonl",
+        input: "stdin",
       },
-      normalizeConfig: (config) => {
-        const normalizeArgs = (args: string[] | undefined) => {
-          if (!args) {
-            return args;
-          }
-          const next = args.filter((arg) => arg !== "--dangerously-skip-permissions");
-          const hasPermissionMode = next.some(
-            (arg, index) =>
-              arg === "--permission-mode" || next[index - 1]?.startsWith("--permission-mode="),
-          );
-          return hasPermissionMode ? next : [...next, "--permission-mode", "bypassPermissions"];
-        };
-        return {
-          ...config,
-          args: normalizeArgs(config.args),
-          resumeArgs: normalizeArgs(config.resumeArgs),
-        };
-      },
+      normalizeConfig: normalizeClaudeBackendConfig,
     }),
     createBackendEntry({
       pluginId: "openai",
@@ -185,11 +176,14 @@ describe("resolveCliBackendConfig claude-cli defaults", () => {
     expect(resolved).not.toBeNull();
     expect(resolved?.config.output).toBe("jsonl");
     expect(resolved?.config.args).toContain("stream-json");
+    expect(resolved?.config.args).toContain("--include-partial-messages");
     expect(resolved?.config.args).toContain("--verbose");
     expect(resolved?.config.args).toContain("--permission-mode");
     expect(resolved?.config.args).toContain("bypassPermissions");
     expect(resolved?.config.args).not.toContain("--dangerously-skip-permissions");
+    expect(resolved?.config.input).toBe("stdin");
     expect(resolved?.config.resumeArgs).toContain("stream-json");
+    expect(resolved?.config.resumeArgs).toContain("--include-partial-messages");
     expect(resolved?.config.resumeArgs).toContain("--verbose");
     expect(resolved?.config.resumeArgs).toContain("--permission-mode");
     expect(resolved?.config.resumeArgs).toContain("bypassPermissions");
@@ -287,6 +281,83 @@ describe("resolveCliBackendConfig claude-cli defaults", () => {
     ]);
     expect(resolved?.config.args).not.toContain("bypassPermissions");
     expect(resolved?.config.resumeArgs).not.toContain("bypassPermissions");
+  });
+
+  it("injects bypassPermissions when custom args omit any permission flag", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          cliBackends: {
+            "claude-cli": {
+              command: "claude",
+              args: ["-p", "--output-format", "stream-json", "--verbose"],
+              resumeArgs: [
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--resume",
+                "{sessionId}",
+              ],
+            },
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+
+    const resolved = resolveCliBackendConfig("claude-cli", cfg);
+
+    expect(resolved).not.toBeNull();
+    expect(resolved?.config.args).toContain("--permission-mode");
+    expect(resolved?.config.args).toContain("bypassPermissions");
+    expect(resolved?.config.resumeArgs).toContain("--permission-mode");
+    expect(resolved?.config.resumeArgs).toContain("bypassPermissions");
+  });
+
+  it("normalizes override-only claude-cli config when the plugin registry is absent", () => {
+    const registry = createEmptyPluginRegistry();
+    setActivePluginRegistry(registry);
+
+    const cfg = {
+      agents: {
+        defaults: {
+          cliBackends: {
+            "claude-cli": {
+              command: "/usr/local/bin/claude",
+              args: ["-p", "--output-format", "json"],
+              resumeArgs: ["-p", "--output-format", "json", "--resume", "{sessionId}"],
+            },
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+
+    const resolved = resolveCliBackendConfig("claude-cli", cfg);
+
+    expect(resolved).not.toBeNull();
+    expect(resolved?.bundleMcp).toBe(true);
+    expect(resolved?.config.args).toEqual([
+      "-p",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypassPermissions",
+    ]);
+    expect(resolved?.config.resumeArgs).toEqual([
+      "-p",
+      "--output-format",
+      "json",
+      "--resume",
+      "{sessionId}",
+      "--permission-mode",
+      "bypassPermissions",
+    ]);
+    expect(resolved?.config.systemPromptArg).toBe("--append-system-prompt");
+    expect(resolved?.config.systemPromptWhen).toBe("first");
+    expect(resolved?.config.sessionArg).toBe("--session-id");
+    expect(resolved?.config.sessionMode).toBe("always");
+    expect(resolved?.config.input).toBe("stdin");
+    expect(resolved?.config.output).toBe("jsonl");
   });
 });
 

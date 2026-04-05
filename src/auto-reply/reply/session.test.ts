@@ -15,17 +15,37 @@ import {
   getSessionBindingService,
   registerSessionBindingAdapter,
 } from "../../infra/outbound/session-binding-service.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import { createChannelTestPluginBase, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { enqueueSystemEvent, resetSystemEventsForTest } from "../../infra/system-events.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
 import { drainFormattedSystemEvents } from "./session-updates.js";
 import { persistSessionUsageUpdate } from "./session-usage.js";
 import { initSessionState } from "./session.js";
 
 // Perf: session-store locks are exercised elsewhere; most session tests don't need FS lock files.
-vi.mock("../../agents/session-write-lock.js", () => ({
-  acquireSessionWriteLock: async () => ({ release: async () => {} }),
-}));
+vi.mock("../../agents/session-write-lock.js", async () => {
+  const actual = await vi.importActual<typeof import("../../agents/session-write-lock.js")>(
+    "../../agents/session-write-lock.js",
+  );
+  return {
+    ...actual,
+    acquireSessionWriteLock: vi.fn(async () => ({ release: async () => {} })),
+    resolveSessionLockMaxHoldFromTimeout: vi.fn(
+      ({
+        timeoutMs,
+        graceMs = 2 * 60 * 1000,
+        minMs = 5 * 60 * 1000,
+      }: {
+        timeoutMs: number;
+        graceMs?: number;
+        minMs?: number;
+      }) => Math.max(minMs, timeoutMs + graceMs),
+    ),
+  };
+});
 
 vi.mock("../../agents/model-catalog.js", () => ({
   loadModelCatalog: vi.fn(async () => [
@@ -1440,6 +1460,7 @@ describe("initSessionState reset triggers in Slack channels", () => {
   }
 
   it("supports mention-prefixed Slack reset commands and preserves args", async () => {
+    setMinimalCurrentConversationBindingRegistryForTests();
     const existingSessionId = "existing-session-123";
     const sessionKey = "agent:main:slack:channel:c2";
     const body = "<@U123> /new take notes";
@@ -1457,6 +1478,7 @@ describe("initSessionState reset triggers in Slack channels", () => {
       ctx: {
         Body: body,
         RawBody: body,
+        BodyForCommands: "/new take notes",
         CommandBody: body,
         From: "slack:channel:C1",
         To: "channel:C1",
@@ -1466,6 +1488,7 @@ describe("initSessionState reset triggers in Slack channels", () => {
         Surface: "slack",
         SenderId: "U123",
         SenderName: "Owner",
+        WasMentioned: true,
       },
       cfg,
       commandAuthorized: true,
@@ -1907,6 +1930,51 @@ describe("drainFormattedSystemEvents", () => {
     } finally {
       resetSystemEventsForTest();
       vi.useRealTimers();
+    }
+  });
+
+  it("keeps channel summary lines prefixed as trusted system output on new main sessions", async () => {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "whatsapp",
+          source: "test",
+          plugin: {
+            ...createChannelTestPluginBase({ id: "whatsapp", label: "WhatsApp" }),
+            config: {
+              listAccountIds: () => ["default"],
+              defaultAccountId: () => "default",
+              inspectAccount: () => ({
+                accountId: "default",
+                enabled: true,
+                configured: true,
+                name: "line one\nline two",
+              }),
+              resolveAccount: () => ({
+                accountId: "default",
+                enabled: true,
+                configured: true,
+                name: "line one\nline two",
+              }),
+            },
+            status: {
+              buildChannelSummary: async () => ({ linked: true }),
+            },
+          },
+        },
+      ]),
+    );
+
+    const result = await drainFormattedSystemEvents({
+      cfg: { channels: {} } as OpenClawConfig,
+      sessionKey: "agent:main:main",
+      isMainSession: true,
+      isNewSession: true,
+    });
+
+    expect(result).toContain("System: WhatsApp: linked");
+    for (const line of result!.split("\n")) {
+      expect(line).toMatch(/^System:/);
     }
   });
 });
@@ -2627,5 +2695,31 @@ describe("initSessionState internal channel routing preservation", () => {
     expect(result.sessionEntry.lastTo).toBe("+15555550123");
     expect(result.sessionEntry.deliveryContext?.channel).toBe("whatsapp");
     expect(result.sessionEntry.deliveryContext?.to).toBe("+15555550123");
+  });
+
+  it("uses the configured default account for persisted routing when AccountId is omitted", async () => {
+    const storePath = await createStorePath("default-account-routing-context-");
+    const cfg = {
+      session: { store: storePath },
+      channels: {
+        discord: {
+          defaultAccount: "work",
+        },
+      },
+    } as OpenClawConfig;
+
+    const result = await initSessionState({
+      ctx: {
+        Body: "hello",
+        SessionKey: "agent:main:discord:channel:24680",
+        OriginatingChannel: "discord",
+        OriginatingTo: "channel:24680",
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.sessionEntry.lastAccountId).toBe("work");
+    expect(result.sessionEntry.deliveryContext?.accountId).toBe("work");
   });
 });
