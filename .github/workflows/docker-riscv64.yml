@@ -1,0 +1,169 @@
+name: Docker riscv64 (experimental)
+
+# Standalone, best-effort riscv64 image publication.
+#
+# Deliberately kept OUT of docker-release.yml: riscv64 is built under QEMU
+# emulation and cannot carry SLSA provenance / SBOM attestation, so it does not
+# belong in the attested amd64/arm64 release manifests or their guard tests.
+# Running it as its own workflow means a slow or failed emulated build can never
+# block or alter the official release; it only ever publishes the standalone
+# :VERSION-riscv64 tag.
+#
+# See Dockerfile.riscv64 for why a separate Dockerfile is needed (no riscv64
+# node base image, no rolldown riscv64 binary, native-addon ABI).
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "!v*-alpha.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable or beta release tag to (re)build for riscv64 (for example v2026.3.22)
+        required: true
+        type: string
+
+concurrency:
+  group: docker-riscv64-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_REGISTRY: docker.io
+  DOCKERHUB_IMAGE_NAME: openclaw/openclaw
+
+jobs:
+  build-riscv64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Resolve source ref
+        id: src
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          PUSH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            ref="refs/tags/${DISPATCH_TAG}"
+          else
+            ref="${PUSH_REF}"
+          fi
+          if [[ "${ref}" != refs/tags/v* ]]; then
+            echo "::error::Expected a v* tag ref, got ${ref}"
+            exit 1
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ steps.src.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve build provenance
+        id: provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Builder
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.DOCKERHUB_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image tags (riscv64)
+        id: tags
+        shell: bash
+        env:
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "value<<EOF"
+            echo "${GHCR_IMAGE}:${VERSION}-riscv64"
+            echo "${DOCKERHUB_IMAGE}:${VERSION}-riscv64"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve OCI labels (riscv64)
+        id: labels
+        shell: bash
+        env:
+          BUILD_TIMESTAMP: ${{ steps.provenance.outputs.built_at }}
+          SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "value<<EOF"
+            echo "org.opencontainers.image.revision=${SOURCE_SHA}"
+            echo "org.opencontainers.image.version=${VERSION}"
+            echo "org.opencontainers.image.created=${BUILD_TIMESTAMP}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push riscv64 image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.riscv64
+          platforms: linux/riscv64
+          cache-from: type=gha,scope=docker-riscv64
+          cache-to: type=gha,mode=max,scope=docker-riscv64
+          build-args: |
+            OPENCLAW_EXTENSIONS=diagnostics-otel,codex
+          tags: ${{ steps.tags.outputs.value }}
+          labels: ${{ steps.labels.outputs.value }}
+          provenance: false
+          push: true
+
+      - name: Smoke test riscv64 runtime
+        shell: bash
+        env:
+          IMAGE_REFS: ${{ steps.tags.outputs.value }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_refs <<< "${IMAGE_REFS}"
+          image_ref="${image_refs[0]}"
+          if [[ -z "${image_ref}" ]]; then
+            echo "::error::No riscv64 image ref resolved for smoke test"
+            exit 1
+          fi
+          docker run --rm --platform linux/riscv64 --entrypoint /bin/sh "${image_ref}" -lc '
+            set -eu
+            node /app/openclaw.mjs --version
+          '
