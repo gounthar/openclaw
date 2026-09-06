@@ -135,6 +135,10 @@ jobs:
           context: .
           file: Dockerfile.riscv64
           platforms: linux/riscv64
+          # Both destinations resolved above, newline-separated; the action
+          # passes each one as --tag. Without them buildx has no push
+          # destination and the step fails before the smoke test can pull.
+          tags: ${{ steps.tags.outputs.value }}
           cache-from: type=gha,scope=docker-riscv64
           cache-to: type=gha,mode=max,scope=docker-riscv64
           build-args: |
