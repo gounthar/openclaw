@@ -97,6 +97,40 @@ describe("resolveConnectedControlUiPresenceKeys", () => {
 });
 
 describe("runBrowserHatchHandoff", () => {
+  it.each([true, false])(
+    "opens utility-only setup on the custodian route (browser=%s)",
+    async (opened) => {
+      const note = vi.fn(async (_message: string, _title?: string) => {});
+      const prompter = createWizardPrompter({ note });
+      const openBrowser = vi.fn(async (_url: string) => opened);
+      sharedMocks.detectBrowserOpenSupport.mockResolvedValue({ ok: true });
+      const config = {
+        meta: { migrations: { utilityModelSeparation: true as const } },
+        agents: { defaults: { utilityModel: "fixture/small" } },
+      };
+      const result = await runBrowserHatchHandoff(
+        { config, prompter },
+        {
+          env: { DISPLAY: ":0" },
+          openBrowser,
+          resolveTarget: async () => ({ ...target, config }),
+          verifyLoopbackAlias: async () => true,
+          probePresence: async () => ({ reachable: true, clientKeys: [] }),
+          pollForClient: async () => ({ connected: true }),
+        },
+      );
+      expect(result).toEqual({ handedOff: true });
+      const url = new URL(openBrowser.mock.calls[0]![0]);
+      expect(url.pathname).toBe("/custodian");
+      expect(url.searchParams.get("onboarding")).toBe("1");
+      expect(url.searchParams.has("session")).toBe(false);
+      expect(url.hash).toContain("bootstrapToken=one-time-bootstrap");
+      if (!opened) {
+        expect(note.mock.calls.flat().join("\n")).toContain("/custodian?onboarding=1");
+      }
+    },
+  );
+
   it("does not hand off when only an existing Control UI heartbeat changes", async () => {
     const prompter = createWizardPrompter();
     let elapsedMs = 0;
@@ -128,13 +162,10 @@ describe("runBrowserHatchHandoff", () => {
     );
   });
 
-  it.each([
-    { platform: "darwin" as const, env: {} },
-    { platform: "linux" as const, env: { DISPLAY: ":0" } },
-    { platform: "linux" as const, env: { WSL_DISTRO_NAME: "Ubuntu" } },
-    { platform: "win32" as const, env: {} },
-  ])("opens once in a $platform GUI session", async ({ platform, env }) => {
-    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true, command: "opener" });
+  it("opens once when the browser is available", async () => {
+    const platform = "darwin";
+    const env = {};
+    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true });
     const prompter = createWizardPrompter();
     const openBrowser = vi.fn(async () => true);
     const probePresence = vi
@@ -168,6 +199,37 @@ describe("runBrowserHatchHandoff", () => {
       "Continue in your browser",
     );
   });
+
+  it.each([true, false])(
+    "preserves the coordinator target in the browser handoff (GUI: %s)",
+    async (gui) => {
+      sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: gui });
+      const prompter = createWizardPrompter();
+      const openBrowser = vi.fn(async () => true);
+      const result = await runBrowserHatchHandoff(
+        { config: {}, prompter, agentId: "coordinator" },
+        {
+          env: {},
+          platform: "darwin",
+          openBrowser,
+          resolveTarget: async () => target,
+          probePresence: async () => ({ reachable: true, clientKeys: [] }),
+          pollForClient: async () => ({ connected: true }),
+        },
+      );
+      expect(result).toEqual({ handedOff: true });
+      if (gui) {
+        expect(openBrowser).toHaveBeenCalledWith(
+          expect.stringContaining("?session=agent%3Acoordinator%3Amain#bootstrapToken="),
+        );
+      } else {
+        expect(prompter.note).toHaveBeenCalledWith(
+          expect.stringContaining("?session=agent%3Acoordinator%3Amain#"),
+          expect.any(String),
+        );
+      }
+    },
+  );
 
   it("probes the configured Gateway without a redundant target URL", async () => {
     const config = { gateway: { port: 19001 } };
@@ -297,7 +359,6 @@ describe("runBrowserHatchHandoff", () => {
     async ({ openBrowser }) => {
       sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({
         ok: true,
-        command: "xdg-open",
       });
       const prompter = createWizardPrompter();
       const pollForClient = vi.fn(async () => ({
@@ -343,7 +404,7 @@ describe("runBrowserHatchHandoff", () => {
   );
 
   it("prints the one-time pairing URL when browser launch fails", async () => {
-    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true, command: "open" });
+    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true });
     const prompter = createWizardPrompter();
 
     await runBrowserHatchHandoff(
@@ -587,30 +648,8 @@ describe("runBrowserHatchHandoff", () => {
     expect(sharedMocks.issueControlUiBrowserHandoff).toHaveBeenCalledWith(target.links);
   });
 
-  it("returns the poll timeout without claiming a handoff", async () => {
-    const prompter = createWizardPrompter();
-
-    const result = await runBrowserHatchHandoff(
-      { config: {}, prompter },
-      {
-        env: { DISPLAY: ":0" },
-        platform: "linux",
-        openBrowser: vi.fn(async () => true),
-        resolveTarget: async () => target,
-        probePresence: async () => ({ reachable: true, clientKeys: [] }),
-        pollForClient: async () => ({ connected: false, reason: "timeout" }),
-      },
-    );
-
-    expect(result).toEqual({ handedOff: false, reason: "timeout" });
-    expect(prompter.note).not.toHaveBeenCalledWith(
-      "Dashboard connected — continuing in your browser.",
-      expect.anything(),
-    );
-  });
-
   it("bounds the final presence probe by the remaining handoff time", async () => {
-    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true, command: "open" });
+    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true });
     const prompter = createWizardPrompter();
     const probeTimeouts: number[] = [];
     let elapsedMs = 0;
@@ -737,7 +776,7 @@ describe("runBrowserHatchHandoff", () => {
   });
 
   it("fails safely when a browser bootstrap cannot be issued", async () => {
-    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true, command: "open" });
+    sharedMocks.detectBrowserOpenSupport.mockResolvedValueOnce({ ok: true });
     const prompter = createWizardPrompter();
     sharedMocks.issueControlUiBrowserHandoff.mockRejectedValue(new Error("state unavailable"));
     const openBrowser = vi.fn();

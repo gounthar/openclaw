@@ -34,6 +34,7 @@ private data class CachedMessageContent(
   val sizeBytes: Long? = null,
   val durationMs: Long? = null,
   val playback: String? = null,
+  val toolActivity: ChatToolActivity? = null,
 )
 
 @Serializable
@@ -48,6 +49,11 @@ private data class CachedMessagePayload(
   val usage: ChatMessageUsage? = null,
   val cost: ChatMessageCost? = null,
   val isSyntheticDisplay: Boolean = false,
+  val runId: String? = null,
+  val steerTargetRunId: String? = null,
+  val turnBoundary: Boolean = false,
+  val phase: String? = null,
+  val isError: Boolean = false,
 )
 
 /**
@@ -228,17 +234,6 @@ internal interface ChatCacheDao {
     keep: Int,
   )
 
-  // Owner-local cleanup runs before the gateway-wide bound below; transcripts never outlive
-  // their corresponding session row.
-  @Query(
-    "DELETE FROM cached_messages WHERE gatewayId = :gatewayId AND agentId = :agentId AND sessionKey NOT IN " +
-      "(SELECT sessionKey FROM cached_sessions WHERE gatewayId = :gatewayId AND agentId = :agentId)",
-  )
-  suspend fun evictOrphanedTranscripts(
-    gatewayId: String,
-    agentId: String,
-  )
-
   // A gateway can expose many agent owners. Cap their aggregate cache by recent writes so
   // switching owners cannot grow the disposable session/transcript tables without bound.
   @Query(
@@ -342,6 +337,7 @@ class RoomChatTranscriptCache internal constructor(
               sizeBytes = part.sizeBytes,
               durationMs = part.durationMs,
               playback = part.playback,
+              toolActivity = part.toolActivity,
             )
           },
         timestampMs = row.timestampMs,
@@ -357,6 +353,11 @@ class RoomChatTranscriptCache internal constructor(
         usage = payload.usage,
         cost = payload.cost,
         isSyntheticDisplay = payload.isSyntheticDisplay,
+        runId = payload.runId,
+        steerTargetRunId = payload.steerTargetRunId,
+        turnBoundary = payload.turnBoundary,
+        phase = payload.phase,
+        isError = payload.isError,
       )
     }
   }
@@ -390,7 +391,6 @@ class RoomChatTranscriptCache internal constructor(
       dao.deleteSessions(gateway, agent)
       dao.insertSessions(rows)
       retainedRow?.let { dao.insertSessions(listOf(it.copy(rowOrder = rows.size))) }
-      dao.evictOrphanedTranscripts(gateway, agent)
       dao.evictGatewaySessionsBeyond(gateway, MAX_CACHED_SESSIONS)
       dao.evictGatewayOrphanedTranscripts(gateway)
     }
@@ -420,6 +420,10 @@ class RoomChatTranscriptCache internal constructor(
                   CachedMessageContent(type = "text", text = part.text)
                 }
 
+                part.toolActivity != null -> {
+                  CachedMessageContent(type = part.type, toolActivity = part.toolActivity)
+                }
+
                 (isImage && !part.artifactId.isNullOrBlank() && !part.url.isNullOrBlank()) ||
                   part.type == "audio" || part.type == "video" || part.type == "file" -> {
                   CachedMessageContent(
@@ -445,7 +449,7 @@ class RoomChatTranscriptCache internal constructor(
             }
           val hasPersistedMetadata =
             message.provenance != null || message.transcriptMarker != null || message.deliveryMirror != null ||
-              message.usage != null || message.cost != null
+              message.usage != null || message.cost != null || message.turnBoundary
           // An empty real call still ends the previous call’s usage snapshot.
           val isRealAssistantBoundary =
             message.role == "assistant" && !message.isSyntheticDisplay && !message.isTranscriptOnlyOpenClawAssistant()
@@ -462,6 +466,11 @@ class RoomChatTranscriptCache internal constructor(
               usage = message.usage,
               cost = message.cost,
               isSyntheticDisplay = message.isSyntheticDisplay,
+              runId = message.runId,
+              steerTargetRunId = message.steerTargetRunId,
+              turnBoundary = message.turnBoundary,
+              phase = message.phase,
+              isError = message.isError,
             )
           Triple(message, role, payload)
         }.takeLast(MAX_CACHED_MESSAGES_PER_SESSION)
@@ -499,7 +508,6 @@ class RoomChatTranscriptCache internal constructor(
         ),
       )
       dao.evictSessionsBeyondKeeping(gateway, agent, keepSessionKey = key, keep = MAX_CACHED_SESSIONS - 1)
-      dao.evictOrphanedTranscripts(gateway, agent)
       dao.evictGatewaySessionsBeyond(gateway, MAX_CACHED_SESSIONS)
       dao.evictGatewayOrphanedTranscripts(gateway)
     }

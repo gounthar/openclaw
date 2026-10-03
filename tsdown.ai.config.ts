@@ -25,7 +25,9 @@ const config = {
     "provider-types": "packages/ai/src/provider-types.ts",
     validation: "packages/ai/src/validation.ts",
     "internal/anthropic": "packages/ai/src/internal/anthropic.ts",
+    "internal/google-model-family": "packages/ai/src/internal/google-model-family.ts",
     "internal/openai": "packages/ai/src/internal/openai.ts",
+    "internal/openai-completions-compat": "packages/ai/src/internal/openai-completions-compat.ts",
     "internal/openai-responses-payload-policy":
       "packages/ai/src/internal/openai-responses-payload-policy.ts",
     "internal/retry-after": "packages/ai/src/internal/retry-after.ts",
@@ -37,6 +39,7 @@ const config = {
   format: "esm",
   outDir: "packages/ai/dist",
   platform: "node",
+  target: "node22",
   deps: {
     neverBundle(id) {
       return externalDependencies.some(

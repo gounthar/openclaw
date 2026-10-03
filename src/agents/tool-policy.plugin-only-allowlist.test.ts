@@ -16,19 +16,10 @@ const pluginGroups: PluginToolGroups = {
 const coreTools = new Set(["read", "write", "exec", "session_status"]);
 
 describe("analyzeAllowlistByToolType", () => {
-  it("preserves allowlist when it only targets plugin tools", () => {
-    const input = { allow: ["lobster"] };
-    const policy = analyzeAllowlistByToolType(input, pluginGroups, coreTools);
-    expect(input).toEqual({ allow: ["lobster"] });
-    expect(policy.pluginOnlyAllowlist).toBe(true);
-    expect(policy.unknownAllowlist).toStrictEqual([]);
-  });
-
   it("preserves allowlist when it only targets plugin groups", () => {
     const input = { allow: ["group:plugins"] };
     const policy = analyzeAllowlistByToolType(input, pluginGroups, coreTools);
     expect(input).toEqual({ allow: ["group:plugins"] });
-    expect(policy.pluginOnlyAllowlist).toBe(true);
     expect(policy.unknownAllowlist).toStrictEqual([]);
   });
 
@@ -46,15 +37,6 @@ describe("analyzeAllowlistByToolType", () => {
     expect(policy.unknownAllowlist).toStrictEqual([]);
   });
 
-  it("preserves allowlist with unknown entries when no core tools match", () => {
-    const emptyPlugins: PluginToolGroups = { all: [], byPlugin: new Map() };
-    const input = { allow: ["lobster"] };
-    const policy = analyzeAllowlistByToolType(input, emptyPlugins, coreTools);
-    expect(input).toEqual({ allow: ["lobster"] });
-    expect(policy.pluginOnlyAllowlist).toBe(false);
-    expect(policy.unknownAllowlist).toEqual(["lobster"]);
-  });
-
   it("keeps allowlist with core tools and reports unknown entries", () => {
     const emptyPlugins: PluginToolGroups = { all: [], byPlugin: new Map() };
     const input = { allow: ["read", "lobster"] };
@@ -63,9 +45,8 @@ describe("analyzeAllowlistByToolType", () => {
     expect(policy.unknownAllowlist).toEqual(["lobster"]);
   });
 
-  it("does not mark unavailable core entries as plugin-only", () => {
+  it("reports unavailable core entries as unknown", () => {
     const policy = analyzeAllowlistByToolType({ allow: ["apply_patch"] }, pluginGroups, coreTools);
-    expect(policy.pluginOnlyAllowlist).toBe(false);
     expect(policy.unknownAllowlist).toEqual(["apply_patch"]);
   });
 
@@ -76,7 +57,6 @@ describe("analyzeAllowlistByToolType", () => {
       pluginToolNames: ["llm-task"],
     });
     expect(input).toEqual({ allow: ["llm-task"] });
-    expect(policy.pluginOnlyAllowlist).toBe(true);
     expect(policy.unknownAllowlist).toStrictEqual([]);
   });
 
@@ -88,7 +68,6 @@ describe("analyzeAllowlistByToolType", () => {
       coreTools,
       { mcpServerNames: ["paperless", "Home Assistant"] },
     );
-    expect(policy.pluginOnlyAllowlist).toBe(true);
     expect(policy.unknownAllowlist).toStrictEqual([]);
   });
 
@@ -100,7 +79,6 @@ describe("analyzeAllowlistByToolType", () => {
       coreTools,
       { mcpServerNames: ["paperless"] },
     );
-    expect(policy.pluginOnlyAllowlist).toBe(false);
     expect(policy.unknownAllowlist).toStrictEqual(["papreless__*"]);
   });
 

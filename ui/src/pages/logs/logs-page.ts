@@ -5,6 +5,7 @@ import { html, type PropertyValues } from "lit";
 import { state } from "lit/decorators.js";
 import { titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
+import { shellLayoutTraits } from "../../app/shell-layout-traits.ts";
 import {
   beginPanelRefresh,
   completePanelRefresh,
@@ -13,7 +14,6 @@ import {
 } from "../../components/panel-refresh-status.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { downloadTextFile } from "../../lib/download.ts";
-import { formatUiError } from "../../lib/format-error.ts";
 import {
   formatMissingOperatorReadScopeMessage,
   isMissingOperatorReadScopeError,
@@ -55,6 +55,7 @@ class LogsPage extends OpenClawLightDomElement {
       void this.loadLogs({ quiet: true });
     },
     false,
+    "visible",
   );
   private contentScrollFrame: number | null = null;
   private logsTaskQuiet = false;
@@ -106,10 +107,17 @@ class LogsPage extends OpenClawLightDomElement {
           this.logsEntries = [];
           this.logsStatus = failPanelRefresh(
             createPanelRefreshStatus(),
-            formatMissingOperatorReadScopeMessage("logs"),
+            result.error,
+            this.gateway.snapshot,
           );
+          if (this.logsStatus.error) {
+            this.logsStatus = {
+              ...this.logsStatus,
+              error: formatMissingOperatorReadScopeMessage("logs"),
+            };
+          }
         } else {
-          this.logsStatus = failPanelRefresh(this.logsStatus, formatUiError(result.error));
+          this.logsStatus = failPanelRefresh(this.logsStatus, result.error, this.gateway.snapshot);
         }
         return;
       }
@@ -266,7 +274,7 @@ class LogsPage extends OpenClawLightDomElement {
       onScroll: (event) => this.streamFollow.handleScroll(event),
     });
     return html`
-      <section class="content-header">
+      <section class="content-header" ${shellLayoutTraits({ toolbarHeader: true })}>
         <div>
           <div class="page-title">${titleForRoute("logs")}</div>
         </div>

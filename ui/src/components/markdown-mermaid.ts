@@ -255,8 +255,9 @@ class OpenClawMermaid extends OpenClawLitElement {
 
   private async copySource() {
     const attempt = ++this.copyAttempt;
-    const copied = await copyToClipboard(this.source);
-    if (this.isConnected && attempt === this.copyAttempt) {
+    const isCurrent = () => this.isConnected && attempt === this.copyAttempt;
+    const copied = await copyToClipboard(this.source, isCurrent);
+    if (isCurrent()) {
       this.copyResult = copied;
     }
   }
@@ -363,7 +364,10 @@ if (!customElements.get("openclaw-mermaid")) {
 
 export function mountMermaidBlocks(root: Element): boolean {
   let mounted = false;
-  for (const block of root.querySelectorAll(".markdown-mermaid")) {
+  const blocks = root.matches(".markdown-mermaid")
+    ? [root]
+    : root.querySelectorAll(".markdown-mermaid");
+  for (const block of blocks) {
     const code = block.querySelector("pre code");
     if (!code) {
       continue;

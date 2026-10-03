@@ -19,13 +19,15 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../../state/openclaw-state-schema.js";
+import { selectStoredGitHubIdentities } from "../../state/user-profile-github-identity.js";
 import {
   selectResolvedUserProfile,
-  selectResolvedUserProfileById,
+  selectResolvedUserProfileMetadataById,
   userProfilesDb,
 } from "../../state/user-profiles-internal.js";
 import { managedSkillCommandName } from "./command-name.js";
 import { SkillLibraryError } from "./errors.js";
+import { stageSkillLibraryAuthorityChange } from "./store-authority.js";
 
 export type SkillLibraryAuthority = {
   /** Host-authenticated profile only. Neither session attribution nor model arguments qualify. */
@@ -35,6 +37,10 @@ export type SkillLibraryAuthority = {
   getConfig: () => OpenClawConfig;
   /** Must revalidate the admitted run/placement and request owner, synchronously at commit. */
   assertCurrent: () => void;
+  /** Additional pure, synchronous admission for client bytes; must not perform database reads. */
+  assertFileMutationAllowed?: () => void;
+  /** Worker-local profile dependencies bound to the host identity owner before disclosure. */
+  profileDependencies?: Set<string>;
 };
 export type SkillLibraryRow = StateDatabase["skill_library_entries"];
 export type SkillLibraryRevisionRow = StateDatabase["skill_library_revisions"];
@@ -87,9 +93,13 @@ export function readSkillLibraryStore<T>(
 
 export function resolveSkillLibraryActor(db: DatabaseSync, authority: SkillLibraryAuthority) {
   authority.assertCurrent();
+  const config = authority.getConfig();
+  if (authority.profileId) {
+    authority.profileDependencies?.add(authority.profileId);
+  }
   const profile =
     authority.profileId && tableExists(db, "user_profiles")
-      ? selectResolvedUserProfileById(db, authority.profileId)
+      ? selectResolvedUserProfileMetadataById(db, authority.profileId)
       : undefined;
   if (authority.profileId && !profile) {
     throw new SkillLibraryError(
@@ -97,10 +107,16 @@ export function resolveSkillLibraryActor(db: DatabaseSync, authority: SkillLibra
       "Your Gateway profile is no longer available. Sign in again before accessing the library.",
     );
   }
+  if (profile) {
+    authority.profileDependencies?.add(profile.id);
+  }
   const ceiling = resolveOperatorRolePolicyForAssignment(
     profile?.id,
     profile?.role ?? null,
-    authority.getConfig(),
+    config,
+    profile && config.gateway?.roles?.assignments?.byGithubLogin
+      ? (selectStoredGitHubIdentities(db, [profile.id]).get(profile.id)?.primary?.login ?? null)
+      : null,
   )?.scopes;
   const permits = (scope: "operator.read" | "operator.write" | "operator.admin") =>
     authorizeOperatorScopesForRequiredScope(scope, [...authority.scopes]).allowed &&
@@ -246,6 +262,12 @@ export function projectSkillLibraryEntry(
 ): SkillLibraryEntry | undefined {
   const actor = resolveSkillLibraryActor(db, authority);
   const owner = canonicalOwner(db, row.owner_profile_id);
+  if (row.owner_profile_id) {
+    authority.profileDependencies?.add(row.owner_profile_id);
+  }
+  if (owner) {
+    authority.profileDependencies?.add(owner);
+  }
   if (
     !actor.read ||
     (!selectedBySession &&
@@ -354,6 +376,7 @@ export function recordSkillLibraryEvent(
   action: string,
   actorProfileId: string,
 ) {
+  stageSkillLibraryAuthorityChange(db);
   executeSqliteQuerySync(
     db,
     skillLibraryDb(db).insertInto("skill_library_events").values({

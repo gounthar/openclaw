@@ -24,7 +24,7 @@ import {
 } from "./error-output.js";
 import { setCommandJsonMode } from "./json-mode.js";
 import { OpenClawCommand } from "./openclaw-command.js";
-import { registerLazyCommand } from "./register-lazy-command.js";
+import { registerCommandGroups } from "./register-command-groups.js";
 
 async function parseLazyGroupError(params: {
   argv: string[];
@@ -54,20 +54,24 @@ async function parseLazyGroupError(params: {
         );
       },
     });
-    registerLazyCommand({
+    registerCommandGroups(
       program,
-      name: params.group,
-      description: `${params.group} commands`,
-      register: () => {
-        const group = program.command(params.group).action(() => {});
-        for (const subcommand of params.subcommands) {
-          const command = group.command(subcommand.name).action(() => {});
-          for (const alias of subcommand.aliases ?? []) {
-            command.alias(alias);
-          }
-        }
-      },
-    });
+      [
+        {
+          placeholders: [{ name: params.group, description: `${params.group} commands` }],
+          register: () => {
+            const group = program.command(params.group).action(() => {});
+            for (const subcommand of params.subcommands) {
+              const command = group.command(subcommand.name).action(() => {});
+              for (const alias of subcommand.aliases ?? []) {
+                command.alias(alias);
+              }
+            }
+          },
+        },
+      ],
+      { eager: false, primary: null, registerPrimaryOnly: false },
+    );
 
     const error = await program.parseAsync(process.argv).catch((cause: unknown) => cause);
     expect(error).toBeInstanceOf(CommanderError);
@@ -703,6 +707,26 @@ describe("formatCliParseErrorOutput", () => {
     expect(output).toBe(
       'Missing required argument "name".\nTry: openclaw plugins install --help\n',
     );
+  });
+
+  it.each([
+    {
+      name: "missing mandatory option",
+      raw: "  ERROR: required option '--node <id>' not specified\n",
+      message: 'Missing required option "--node <id>".',
+    },
+    {
+      name: "unclassified Commander diagnostic",
+      raw: "error: option '--timeout <ms>' argument missing\n",
+      message: "OpenClaw could not parse this command: option '--timeout <ms>' argument missing",
+    },
+  ])("preserves the complete ordinary $name diagnostic", ({ raw, message }) => {
+    expect(
+      formatCliParseErrorOutput(raw, {
+        argv: ["node", "openclaw", "nodes", "invoke"],
+        commandPath: ["nodes", "invoke"],
+      }),
+    ).toBe(`${message}\nTry: openclaw nodes invoke --help\n`);
   });
 
   it("prefers the parsed Commander path over option-like argv values", () => {

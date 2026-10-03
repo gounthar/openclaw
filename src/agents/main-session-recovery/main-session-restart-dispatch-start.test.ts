@@ -30,13 +30,15 @@ const globalLane = "recovery-capacity-global";
 const startTurn = vi.hoisted(() => vi.fn<(params: { io: AgentTurnIo }) => Promise<void>>());
 
 vi.mock("../../gateway/server-methods.js", () => ({
-  authorizeGatewayRequestPreDispatch: async () => ({ error: null }),
   createRequestGatewayMethodRegistry: () => ({ isControlPlaneWrite: () => false }),
   runWithGatewayRequestEnvelope: async (
     _method: string,
     _client: unknown,
     run: () => Promise<unknown>,
   ) => await run(),
+}));
+vi.mock("../../gateway/server-methods/request-authorization.js", () => ({
+  authorizeGatewayRequestPreDispatch: async () => ({ error: null }),
 }));
 vi.mock("../../gateway/agent-turn/agent-request-preflight.js", () => ({
   prepareAgentRequestPreflight: ({ request }: { request: unknown }) => ({ request }),
@@ -159,6 +161,7 @@ describe("restart recovery startup ownership", () => {
       })();
       return execution;
     });
+    const onSettled = vi.fn();
     const recovery = dispatchRestartRecoveryUntilStarted({
       agentParams: {
         agentId: "main",
@@ -168,6 +171,7 @@ describe("restart recovery startup ownership", () => {
         sessionKey,
       },
       gatewayRuntime: runtime.recovery,
+      onSettled,
     });
     try {
       await registered.promise;
@@ -193,6 +197,7 @@ describe("restart recovery startup ownership", () => {
       if (stage === "cached queue") {
         await vi.advanceTimersByTimeAsync(10_000);
       }
+      expect(onSettled).not.toHaveBeenCalled();
       await expect(recovery).resolves.toMatchObject({
         kind: "started",
         observation: { dispatchAccepted: true, executionStarted: true },
@@ -205,6 +210,10 @@ describe("restart recovery startup ownership", () => {
       }
       await execution?.catch(() => {});
       await recovery;
+      await vi.advanceTimersByTimeAsync(0);
+      if (stage !== "cached queue" && stage !== "expired startup") {
+        expect(onSettled).toHaveBeenCalledOnce();
+      }
       registration.cleanup();
       runtime.close();
     }

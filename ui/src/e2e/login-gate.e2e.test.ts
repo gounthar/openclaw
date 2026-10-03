@@ -26,6 +26,76 @@ beforeEach(() => {
 });
 
 suite.define(() => {
+  it("counts down and automatically enters a reachable Gateway after refused upgrades", async () => {
+    const context = await suite.browser.newContext({ viewport: { height: 900, width: 1280 } });
+    const page = await context.newPage();
+    await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+    await page.clock.pauseAt(new Date("2026-01-01T00:00:01Z"));
+    const gateway = await installMockGateway(page, { awaitInitialRoster: false });
+    await page.route("**/healthz", (route) =>
+      route.fulfill({ status: 200, json: { ok: true, status: "live" } }),
+    );
+    await page.addInitScript(() => {
+      class RefusedWebSocket extends EventTarget {
+        readyState: WebSocket["readyState"] = WebSocket.CONNECTING;
+
+        send() {
+          throw new Error("Upgrade failed before WebSocket open");
+        }
+
+        close() {
+          this.readyState = WebSocket.CLOSED;
+        }
+      }
+      let refused = 0;
+      window.WebSocket = new Proxy(window.WebSocket, {
+        construct(target, args) {
+          if (refused++ >= 2) {
+            return Reflect.construct(target, args);
+          }
+          const socket = new RefusedWebSocket();
+          queueMicrotask(() => {
+            socket.readyState = WebSocket.CLOSED;
+            socket.dispatchEvent(new Event("error"));
+            socket.dispatchEvent(new CloseEvent("close", { code: 1006 }));
+          });
+          return socket;
+        },
+      });
+    });
+
+    try {
+      await page.goto(suite.server.baseUrl);
+      await page.clock.runFor(1);
+      const failure = page.locator('.login-gate__failure[data-kind="busy"]');
+      await failure.waitFor();
+      expect((await failure.locator(".login-gate__failure-title").textContent())?.trim()).toBe(
+        "Gateway busy, retrying…",
+      );
+      expect(await gateway.getRequests("connect")).toHaveLength(0);
+
+      const retryHealthResponse = page.waitForResponse("**/healthz");
+      await page.clock.runFor(1_000);
+      // The first probe's busy state can survive while the retry probe is still in flight.
+      // Finish its real response before advancing the virtual one-second abort deadline.
+      expect(await (await retryHealthResponse).finished()).toBeNull();
+      const countdown = failure.locator(".login-gate__retry");
+      await countdown.filter({ hasText: "Retrying in 2s…" }).waitFor();
+      await page.clock.runFor(1_000);
+      expect((await countdown.textContent())?.trim()).toBe("Retrying in 1s…");
+      expect(await page.locator("openclaw-app-shell").count()).toBe(0);
+
+      await page.clock.runFor(1_000);
+      await gateway.waitForRequest("connect");
+      await page.clock.runFor(1);
+      await page.locator("openclaw-app-shell").waitFor();
+      expect(await page.locator("openclaw-login-gate").count()).toBe(0);
+      expect(await gateway.getRequests("connect")).toHaveLength(1);
+    } finally {
+      await closeContext(context);
+    }
+  });
+
   it("shows a bare protocol mismatch as compatibility guidance without reconnecting", async () => {
     const context = await suite.browser.newContext({ viewport: { height: 900, width: 1280 } });
     const page = await context.newPage();
@@ -103,15 +173,15 @@ suite.define(() => {
     }
   });
 
-  it("blocks non-chat page actions visibly while reconnecting", async () => {
+  it("blocks server settings actions visibly while reconnecting", async () => {
     const context = await suite.browser.newContext({ viewport: { height: 900, width: 1280 } });
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
 
     try {
-      await page.goto(new URL("settings/connection", suite.server.baseUrl).href);
+      await page.goto(new URL("settings/talk", suite.server.baseUrl).href);
       await page.locator("openclaw-app-shell").waitFor();
-      await page.locator("openclaw-connection-page .content-header").waitFor();
+      await page.locator("openclaw-config-page .content-header").waitFor();
       await gateway.deferNext("connect");
       await gateway.closeLatest(1012, "test reconnect");
 
@@ -131,7 +201,7 @@ suite.define(() => {
         const navRect = document.querySelector(".shell-nav")?.getBoundingClientRect();
         const mainRect = document.querySelector("#control-ui-main")?.getBoundingClientRect();
         const headerRect = document
-          .querySelector("openclaw-connection-page .content-header")
+          .querySelector("openclaw-config-page .content-header")
           ?.getBoundingClientRect();
         return {
           headerTop: headerRect?.top,
@@ -213,7 +283,7 @@ suite.define(() => {
   });
 
   it.each([
-    { name: "tablet", width: 1024 },
+    { name: "tablet", width: 900 },
     { name: "phone", width: 390 },
   ])("spans the $name settings viewport while reconnecting", async ({ width }) => {
     const context = await suite.browser.newContext({ viewport: { height: 900, width } });
@@ -221,7 +291,7 @@ suite.define(() => {
     const gateway = await installMockGateway(page);
 
     try {
-      await page.goto(new URL("settings/connection", suite.server.baseUrl).href);
+      await page.goto(new URL("settings/talk", suite.server.baseUrl).href);
       await page.locator("openclaw-app-shell").waitFor();
       await gateway.deferNext("connect");
       await gateway.closeLatest(1012, "test reconnect");
@@ -245,7 +315,7 @@ suite.define(() => {
         details: { code: ConnectErrorDetailCodes.AUTH_TOKEN_MISSING },
       },
       expectedKind: "auth-required",
-      expectedTitle: "Auth required",
+      expectedTitle: "This Gateway expects its token",
     },
     {
       name: "missing identity header",
@@ -288,7 +358,7 @@ suite.define(() => {
         details: { code: ConnectErrorDetailCodes.PAIRING_REQUIRED },
       },
       expectedKind: "pairing-required",
-      expectedTitle: "Device pairing required",
+      expectedTitle: "Approve this browser",
     },
     {
       name: "generic transport",
@@ -297,7 +367,7 @@ suite.define(() => {
         message: "WebSocket connection failed",
       },
       expectedKind: "network",
-      expectedTitle: "Could not connect",
+      expectedTitle: "Gateway unreachable",
     },
     {
       name: "profile verification",
@@ -308,7 +378,7 @@ suite.define(() => {
         retryable: true,
       },
       expectedKind: "profile-unavailable",
-      expectedTitle: "Profile verification unavailable",
+      expectedTitle: "Couldn't verify your account",
     },
     {
       name: "GitHub profile rate limit",
@@ -320,13 +390,16 @@ suite.define(() => {
         retryable: true,
       },
       expectedKind: "profile-unavailable",
-      expectedTitle: "Profile verification unavailable",
+      expectedTitle: "Couldn't verify your account",
     },
   ])("renders $name guidance from the application gateway snapshot", async (fixture) => {
     const viewport = { height: 900, width: 1280 };
     const context = await suite.browser.newContext({
       viewport,
-      recordVideo: { dir: RECOVERY_ARTIFACT_DIR, size: viewport },
+      recordVideo:
+        process.env.OPENCLAW_CAPTURE_UI_PROOF === "1"
+          ? { dir: RECOVERY_ARTIFACT_DIR, size: viewport }
+          : undefined,
     });
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
@@ -350,7 +423,7 @@ suite.define(() => {
       );
       const failure = page.locator(`.login-gate__failure[data-kind="${fixture.expectedKind}"]`);
       await failure.waitFor({ timeout: 10_000 });
-      expect(await failure.locator(".login-gate__failure-title").textContent()).toBe(
+      expect((await failure.locator(".login-gate__failure-title").textContent())?.trim()).toBe(
         fixture.expectedTitle,
       );
     } catch (error) {
@@ -359,6 +432,53 @@ suite.define(() => {
         label: `login-guidance-${fixture.name}`,
       });
       throw error;
+    } finally {
+      await closeContext(context);
+    }
+  });
+
+  it("retries pending pairing and enters the app after approval without clicks", async () => {
+    const context = await suite.browser.newContext({ viewport: { height: 900, width: 1280 } });
+    const page = await context.newPage();
+    const gateway = await installMockGateway(page, { deferredMethods: ["connect"] });
+    const pairingError = {
+      code: "NOT_PAIRED",
+      message: "pairing required (requestId: req-pending)",
+      details: {
+        code: ConnectErrorDetailCodes.PAIRING_REQUIRED,
+        recommendedNextStep: "wait_then_retry",
+        retryable: true,
+        pauseReconnect: false,
+      },
+    };
+
+    try {
+      await page.goto(suite.server.baseUrl);
+      await gateway.waitForRequest("connect");
+      await gateway.deferNext("connect");
+      await gateway.rejectDeferred("connect", pairingError);
+      const failure = page.locator('.login-gate__failure[data-kind="pairing-required"]');
+      await failure.waitFor();
+      await gateway.waitForRequest("connect", { after: 1 });
+      await page.screenshot({
+        path: path.join(RECOVERY_ARTIFACT_DIR, "pairing-wait.png"),
+        fullPage: true,
+      });
+      expect(await failure.textContent()).toContain(
+        "Waiting for approval… this page connects on its own once the request is approved.",
+      );
+      expect(
+        await failure.getByRole("button", { name: "Check now", exact: true }).isEnabled(),
+      ).toBe(true);
+      expect(await page.locator("openclaw-app-shell").count()).toBe(0);
+
+      await gateway.deferNext("connect");
+      await gateway.rejectDeferred("connect", pairingError);
+      await gateway.waitForRequest("connect", { after: 2 });
+      expect(await failure.isVisible()).toBe(true);
+      await gateway.resolveDeferred("connect");
+      await page.locator("openclaw-app-shell").waitFor();
+      expect(await page.locator("openclaw-login-gate").count()).toBe(0);
     } finally {
       await closeContext(context);
     }
@@ -445,7 +565,7 @@ suite.define(() => {
     const page = await context.newPage();
 
     try {
-      await renderLoginGate(page, suite.server.baseUrl);
+      const gateway = await renderLoginGate(page, suite.server.baseUrl);
       const gatewayInput = page.locator(".login-gate__form .field input").first();
       expect(await gatewayInput.getAttribute("inputmode")).toBe("url");
       expect(await gatewayInput.getAttribute("autocapitalize")).toBe("none");
@@ -453,8 +573,27 @@ suite.define(() => {
       expect(await gatewayInput.getAttribute("spellcheck")).toBe("false");
       expect(await gatewayInput.getAttribute("enterkeyhint")).toBe("go");
 
+      // App renders must retain the real connection action, not a fixture-owned callback.
+      await page.evaluate(async () => {
+        const app = document.querySelector<
+          HTMLElement & { requestUpdate(): void; updateComplete: Promise<unknown> }
+        >("openclaw-app")!;
+        app.requestUpdate();
+        await app.updateComplete;
+        await document.querySelector<HTMLElement & { updateComplete: Promise<unknown> }>(
+          "openclaw-login-gate",
+        )!.updateComplete;
+      });
+      await gateway.deferNext("connect");
       await gatewayInput.press("Enter");
-      expect(await page.locator("body").getAttribute("data-connect-count")).toBe("1");
+      await gateway.waitForRequest("connect", { after: 1 });
+      expect(await gateway.getRequests("connect")).toHaveLength(2);
+      await gateway.rejectDeferred("connect", {
+        code: "INVALID_REQUEST",
+        message: "token missing",
+        details: { code: ConnectErrorDetailCodes.AUTH_TOKEN_MISSING },
+      });
+      await page.locator('.login-gate__failure[data-kind="auth-required"]').waitFor();
 
       const metrics = await page.evaluate(() => {
         const gate = document.querySelector<HTMLElement>(".login-gate");
@@ -499,8 +638,8 @@ suite.define(() => {
         };
       });
 
-      expect(metrics.gatePadding).toBe("16px 12px");
-      expect(metrics.cardPadding).toBe("24px 20px");
+      expect(metrics.gatePadding).toBe("16px");
+      expect(metrics.cardPadding).toBe("20px 20px 24px");
       expect(metrics.cardTop).toBeGreaterThanOrEqual(0);
       expect(metrics.documentScrollWidth).toBe(metrics.documentClientWidth);
       expect(metrics.commandBounds.length).toBeGreaterThan(0);
@@ -510,8 +649,8 @@ suite.define(() => {
       expect(metrics.connectMinHeight).toBe("44px");
       expect(metrics.gateOverflowY).toBe("auto");
       expect(metrics.gateScrollHeight).toBeGreaterThan(metrics.gateClientHeight);
-      expect(metrics.inputMinHeights.every((height) => height === "44px")).toBe(true);
-      expect(metrics.toggleSizes).toHaveLength(2);
+      expect(metrics.inputMinHeights).toEqual(["44px", "44px"]);
+      expect(metrics.toggleSizes).toHaveLength(1);
       expect(
         metrics.toggleSizes.every(({ height, width }) => height === "32px" && width === "32px"),
       ).toBe(true);
@@ -528,106 +667,134 @@ suite.define(() => {
     }
   });
 
-  it("keeps failure recovery visible while generic help stays collapsed", async () => {
+  it("keeps failure recovery visible without generic help", async () => {
     const context = await suite.browser.newContext({ viewport: { height: 900, width: 1280 } });
     const page = await context.newPage();
 
     try {
       await renderLoginGate(page, suite.server.baseUrl);
       const failure = page.locator(".login-gate__failure");
-      expect(await failure.evaluate((element) => element.tagName)).toBe("DIV");
+      expect(await failure.evaluate((element) => element.tagName)).toBe("SECTION");
       expect(await page.locator(".login-gate__failure-summary").isVisible()).toBe(true);
       expect(await page.locator(".login-gate__failure-steps").isVisible()).toBe(true);
       expect(await page.locator(".login-gate__failure-docs").isVisible()).toBe(true);
+      expect(await page.locator(".login-gate__help").count()).toBe(0);
+    } finally {
+      await closeContext(context);
+    }
+  });
+
+  it("keeps generic help collapsed until requested when there is no failure", async () => {
+    const context = await suite.browser.newContext({ viewport: { height: 900, width: 1280 } });
+    const page = await context.newPage();
+
+    try {
+      await renderLoginGate(page, suite.server.baseUrl, { lastError: null });
+      expect(await page.locator(".login-gate__failure").count()).toBe(0);
 
       const help = page.locator(".login-gate__help");
       expect(await help.evaluate((element) => element.tagName)).toBe("DETAILS");
       expect(await help.getAttribute("open")).toBeNull();
       expect(await page.locator(".login-gate__steps").isVisible()).toBe(false);
+      await help.locator("summary").click();
+      expect(await page.locator(".login-gate__steps").isVisible()).toBe(true);
     } finally {
       await closeContext(context);
     }
   });
 
-  it("applies standalone safe-area insets exactly once", async () => {
-    const context = await suite.browser.newContext({
-      hasTouch: true,
-      isMobile: true,
-      viewport: { height: 500, width: 375 },
-    });
-    const page = await context.newPage();
-
-    try {
-      await renderLoginGate(page, suite.server.baseUrl);
-      const metrics = await page.evaluate(() => {
-        const root = document.documentElement;
-        root.style.setProperty("--safe-area-top", "34px");
-        root.style.setProperty("--safe-area-right", "20px");
-        root.style.setProperty("--safe-area-bottom", "21px");
-        root.style.setProperty("--safe-area-left", "18px");
-
-        const mediaRules = Array.from(document.styleSheets).flatMap((sheet) =>
-          Array.from(sheet.cssRules).filter(
-            (rule): rule is CSSMediaRule =>
-              rule instanceof CSSMediaRule &&
-              rule.conditionText.includes("display-mode: standalone"),
-          ),
-        );
-        const standaloneBodyRule = mediaRules.find((mediaRule) =>
-          Array.from(mediaRule.cssRules).some(
-            (rule) => rule instanceof CSSStyleRule && rule.selectorText === "body",
-          ),
-        );
-        const standaloneGateRule = mediaRules.find((mediaRule) =>
-          Array.from(mediaRule.cssRules).some(
-            (rule) => rule instanceof CSSStyleRule && rule.selectorText === ".login-gate",
-          ),
-        );
-        if (!standaloneBodyRule || !standaloneGateRule) {
-          throw new Error("Missing standalone safe-area ownership rules");
-        }
-
-        // Headless Chromium cannot toggle installed-app display mode reliably.
-        // Apply the exact production inner rules to verify their computed layout.
-        const activeStandaloneRules = document.createElement("style");
-        activeStandaloneRules.textContent = [standaloneBodyRule, standaloneGateRule]
-          .flatMap((mediaRule) => Array.from(mediaRule.cssRules, (rule) => rule.cssText))
-          .join("\n");
-        document.head.append(activeStandaloneRules);
-
-        const gate = document.querySelector<HTMLElement>(".login-gate");
-        if (!gate) {
-          throw new Error("Missing login gate element");
-        }
-        const bodyStyle = getComputedStyle(document.body);
-        const gateStyle = getComputedStyle(gate);
-        const gateBounds = gate.getBoundingClientRect();
-        return {
-          bodyPadding: {
-            bottom: bodyStyle.paddingBottom,
-            left: bodyStyle.paddingLeft,
-            right: bodyStyle.paddingRight,
-            top: bodyStyle.paddingTop,
-          },
-          gateBottom: gateBounds.bottom,
-          gatePadding: gateStyle.padding,
-          gateRuleCondition: standaloneGateRule.conditionText,
-          gateTop: gateBounds.top,
-        };
+  it.each([false, true])(
+    "applies safe-area insets exactly once (standalone: %s)",
+    async (standalone) => {
+      const context = await suite.browser.newContext({
+        hasTouch: true,
+        isMobile: true,
+        viewport: { height: 500, width: 375 },
       });
-
-      expect(metrics.bodyPadding).toEqual({
-        bottom: "21px",
-        left: "18px",
-        right: "20px",
-        top: "34px",
-      });
-      expect(metrics.gatePadding).toBe("16px 12px");
-      expect(metrics.gateRuleCondition).toContain("display-mode: standalone");
-      expect(metrics.gateTop).toBe(34);
-      expect(metrics.gateBottom).toBe(479);
-    } finally {
-      await closeContext(context);
-    }
-  });
+      const page = await context.newPage();
+      try {
+        await renderLoginGate(page, suite.server.baseUrl);
+        const metrics = await page.evaluate((installed) => {
+          const root = document.documentElement;
+          root.style.setProperty("--safe-area-top", "34px");
+          root.style.setProperty("--safe-area-right", "20px");
+          root.style.setProperty("--safe-area-bottom", "21px");
+          root.style.setProperty("--safe-area-left", "18px");
+          if (installed) {
+            // Installed-mode contract simulation, not a native iPhone capture.
+            for (const sheet of document.styleSheets) {
+              for (const rule of sheet.cssRules) {
+                if (rule instanceof CSSMediaRule) {
+                  rule.media.mediaText = rule.conditionText.replaceAll(
+                    "(display-mode: standalone)",
+                    "(min-width: 0px)",
+                  );
+                }
+              }
+            }
+          }
+          const app = document.querySelector("openclaw-app");
+          const gate = app?.querySelector<HTMLElement>(".login-gate");
+          if (!app || !gate) {
+            throw new Error("Missing production login gate wrapper");
+          }
+          const bounds = gate.getBoundingClientRect();
+          return {
+            bodyPadding: getComputedStyle(document.body).padding,
+            appPadding: getComputedStyle(app).padding,
+            gatePadding: getComputedStyle(gate).padding,
+            top: bounds.top,
+            bottom: bounds.bottom,
+            left: bounds.left,
+            right: bounds.right,
+          };
+        }, standalone);
+        expect(metrics.bodyPadding).toBe("0px");
+        expect(metrics.appPadding).toBe("34px 20px 21px 18px");
+        expect(metrics.gatePadding).toBe("16px");
+        expect(metrics.top).toBe(34);
+        expect(metrics.bottom).toBe(479);
+        expect(metrics.left).toBe(18);
+        expect(metrics.right).toBe(355);
+        const docs = page.locator(".login-gate__failure-docs");
+        await docs.scrollIntoViewIfNeeded();
+        const docsBounds = await docs.boundingBox();
+        expect(docsBounds).not.toBeNull();
+        expect(docsBounds!.y + docsBounds!.height).toBeLessThanOrEqual(479);
+        const input = page.locator(".login-gate__form .field input").first();
+        await input.focus();
+        const resizeViewport = async (height: number) =>
+          page.evaluate(async (visibleHeight) => {
+            const viewport = window.visualViewport!;
+            Object.defineProperty(viewport, "height", { configurable: true, value: visibleHeight });
+            viewport.dispatchEvent(new Event("resize"));
+            await new Promise<void>((resolve) => {
+              requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+            });
+            return {
+              height: document.querySelector("openclaw-app")!.getBoundingClientRect().height,
+              bottomInset: document.documentElement.style.getPropertyValue(
+                "--shell-safe-area-bottom",
+              ),
+            };
+          }, height);
+        expect(await resizeViewport(300)).toEqual({ height: 300, bottomInset: "0px" });
+        await input.scrollIntoViewIfNeeded();
+        const inputBounds = await input.boundingBox();
+        expect(inputBounds!.y + inputBounds!.height).toBeLessThanOrEqual(300);
+        expect(await resizeViewport(500)).toEqual({ height: 500, bottomInset: "" });
+        expect(await input.evaluate((element) => document.activeElement === element)).toBe(true);
+        await resizeViewport(300);
+        const cleaned = await page.evaluate(() => {
+          document.querySelector("openclaw-app")!.remove();
+          return ["--shell-viewport-height", "--shell-safe-area-bottom"].map((name) =>
+            document.documentElement.style.getPropertyValue(name),
+          );
+        });
+        expect(cleaned).toEqual(["", ""]);
+      } finally {
+        await closeContext(context);
+      }
+    },
+  );
 });

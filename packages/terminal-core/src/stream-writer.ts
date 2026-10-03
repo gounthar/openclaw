@@ -10,8 +10,6 @@ export type SafeStreamWriterOptions = {
 export type SafeStreamWriter = {
   write: (stream: NodeJS.WriteStream, text: string) => boolean;
   writeLine: (stream: NodeJS.WriteStream, text: string) => boolean;
-  reset: () => void;
-  isClosed: () => boolean;
 };
 
 /** Detect broken pipe style stream errors. */
@@ -52,15 +50,8 @@ export function createSafeStreamWriter(options: SafeStreamWriterOptions = {}): S
     }
   };
 
-  const writeLine = (stream: NodeJS.WriteStream, text: string): boolean =>
-    write(stream, `${text}\n`);
-
   return {
     write,
-    writeLine,
-    reset: () => {
-      closed = false;
-    },
-    isClosed: () => closed,
+    writeLine: (stream, text) => write(stream, `${text}\n`),
   };
 }

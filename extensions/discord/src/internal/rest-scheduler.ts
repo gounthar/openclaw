@@ -1,4 +1,3 @@
-// Discord plugin module implements rest scheduler behavior.
 import { resolveIntegerOption, resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { RateLimitError, readDiscordRateLimitBucket, readRetryAfter } from "./rest-errors.js";
 import {
@@ -214,16 +213,8 @@ export class RestScheduler<TData> {
         requestPriorities.map((lane) => [lane, this.getOldestQueuedAge(lane)]),
       ),
       activeWorkers: this.activeWorkers,
-      maxConcurrentWorkers: this.maxConcurrentWorkers,
+      maxConcurrentWorkers: this.options.maxConcurrency,
     };
-  }
-
-  private get maxConcurrentWorkers(): number {
-    return this.options.maxConcurrency;
-  }
-
-  private get maxRateLimitRetries(): number {
-    return this.options.maxRateLimitRetries;
   }
 
   private getBucket(key: string): BucketState<TData> {
@@ -254,35 +245,6 @@ export class RestScheduler<TData> {
 
   private isBucketRateLimited(bucket: BucketState<TData>, now = Date.now()): boolean {
     return bucket.remaining === 0 && bucket.resetAt > now;
-  }
-
-  private pruneRouteMapping(routeKey: string): void {
-    const bucketKey = this.routeBuckets.get(routeKey);
-    if (!bucketKey) {
-      return;
-    }
-    this.routeBuckets.delete(routeKey);
-    this.buckets.get(bucketKey)?.routeKeys.delete(routeKey);
-  }
-
-  private pruneIdleRouteMappings(
-    bucketKey: string,
-    bucket: BucketState<TData>,
-    now = Date.now(),
-  ): void {
-    if (bucket.active > 0 || countPending(bucket) > 0 || this.isBucketRateLimited(bucket, now)) {
-      return;
-    }
-    for (const routeKey of Array.from(bucket.routeKeys)) {
-      if (this.routeBuckets.get(routeKey) === bucketKey) {
-        this.pruneRouteMapping(routeKey);
-      }
-    }
-  }
-
-  private shouldPruneIdleBucket(key: string): boolean {
-    const mappedBucketKey = this.routeBuckets.get(key);
-    return mappedBucketKey !== key && !this.hasBucketReference(key);
   }
 
   private bindRouteToBucket(routeKey: string, bucketKey: string): BucketState<TData> {
@@ -398,7 +360,7 @@ export class RestScheduler<TData> {
 
   private drainQueues(): void {
     let nextDelayMs = Number.POSITIVE_INFINITY;
-    while (this.activeWorkers < this.maxConcurrentWorkers) {
+    while (this.activeWorkers < this.options.maxConcurrency) {
       const next = this.takeNextQueuedRequest();
       if (!next.queued) {
         if (next.waitMs !== undefined) {
@@ -495,8 +457,13 @@ export class RestScheduler<TData> {
       if (this.isBucketRateLimited(bucket, now)) {
         continue;
       }
-      this.pruneIdleRouteMappings(key, bucket, now);
-      if (this.shouldPruneIdleBucket(key)) {
+      for (const routeKey of bucket.routeKeys) {
+        if (this.routeBuckets.get(routeKey) === key) {
+          this.routeBuckets.delete(routeKey);
+          bucket.routeKeys.delete(routeKey);
+        }
+      }
+      if (this.routeBuckets.get(key) !== key && !this.hasBucketReference(key)) {
         this.buckets.delete(key);
       }
     }
@@ -535,7 +502,7 @@ export class RestScheduler<TData> {
   private requeueRateLimitedRequest(queued: ScheduledRequest<TData>): boolean {
     if (
       queued.generation !== this.queueGeneration ||
-      queued.retryCount >= this.maxRateLimitRetries
+      queued.retryCount >= this.options.maxRateLimitRetries
     ) {
       return false;
     }
@@ -569,7 +536,7 @@ export class RestScheduler<TData> {
         schedule.push(lane);
       }
     }
-    return schedule.length > 0 ? schedule : [...requestPriorities];
+    return schedule;
   }
 
   private getOldestQueuedAge(lane: RequestPriority): number {

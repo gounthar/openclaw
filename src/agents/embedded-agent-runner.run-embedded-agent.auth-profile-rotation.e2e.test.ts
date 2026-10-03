@@ -1,17 +1,21 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { redactIdentifier } from "@openclaw/normalization-core/node-crypto";
 import type { AssistantMessage } from "openclaw/plugin-sdk/llm";
 // End-to-end auth-profile rotation coverage for embedded runner retries.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { redactIdentifier } from "../logging/redact-identifier.js";
 import { wrapRunWithTestPreparedAdmission } from "./admitted-run-context.test-support.js";
 import {
   resolveInlineProviderApiKeyUsageId,
   type AuthProfileFailureReason,
 } from "./auth-profiles.js";
+import {
+  createApiKeyCredential,
+  createAuthProfileStoreFixture,
+} from "./auth-profiles/credential-fixtures.test-support.js";
 import { ensureAuthProfileStore, saveAuthProfileStore } from "./auth-profiles/store-runtime.js";
 import type { EmbeddedRunAttemptResult } from "./embedded-agent-runner/run/types.js";
 import type { AgentHarness } from "./harness/types.js";
@@ -59,6 +63,7 @@ const installRunEmbeddedMocks = () => {
     resolveModelAsync: async (provider: string, modelId: string) => {
       const subscriptionModel = modelId === "chatgpt-mock";
       return {
+        logicalRef: { provider, model: modelId },
         model: {
           id: modelId,
           name: modelId,
@@ -303,12 +308,9 @@ const writeAuthStore = async (
 
 const writeCopilotAuthStore = async (agentDir: string, token = "gh-token") => {
   saveAuthProfileStore(
-    {
-      version: 1,
-      profiles: {
-        "github-copilot:github": { type: "token", provider: "github-copilot", token },
-      },
-    },
+    createAuthProfileStoreFixture({
+      "github-copilot:github": { type: "token", provider: "github-copilot", token },
+    }),
     agentDir,
   );
 };
@@ -318,11 +320,7 @@ const writeOpenAiCodexAuthStore = async (agentDir: string, includeBackup = false
     {
       version: 1,
       profiles: {
-        "openai:work": {
-          type: "api_key",
-          provider: "openai",
-          key: "sk-codex",
-        },
+        "openai:work": createApiKeyCredential("openai", "sk-codex"),
         ...(includeBackup
           ? {
               "openai:backup": {
@@ -351,6 +349,8 @@ const makeErrorAttempt = (
     ...overrides,
   });
   return makeAttempt({
+    // Rotation-only fixtures disable retries; retry-budget cases override this.
+    providerRetryMaxRetries: 0,
     assistantTexts: [],
     lastAssistant: assistant,
     ...(opts?.currentAttempt ? { currentAttemptAssistant: assistant } : {}),
@@ -456,8 +456,7 @@ async function runAutoPinnedRotationCase(params: {
   runEmbeddedAttemptMock.mockReset();
   return withAgentWorkspace(async ({ agentDir, workspaceDir }) => {
     await writeAuthStore(agentDir);
-    // This provider reports a three-retry cap; exhaust it before rotating.
-    // Credential/quota failures still rotate after the first failed attempt.
+    // Exhaust this provider's three-retry cap before rotating on transient failures.
     const failureCount = params.exhaustTransientRetries ? 4 : 1;
     for (let attempt = 0; attempt < failureCount; attempt += 1) {
       runEmbeddedAttemptMock.mockResolvedValueOnce({
@@ -920,7 +919,7 @@ describe("runEmbeddedAgent auth profile rotation", () => {
     }
   });
 
-  it("rotates auto-pinned profiles on long-window rate limits without transient retries", async () => {
+  it("rotates auto-pinned profiles immediately on long-window rate limits", async () => {
     await runAutoPinnedRotationCase({
       errorMessage: "429 Too Many Requests: subscription usage limit reached",
       sessionKey: "agent:test:auto",

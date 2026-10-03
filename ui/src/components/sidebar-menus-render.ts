@@ -1,9 +1,11 @@
 import { html, nothing } from "lit";
 import { keyed } from "lit/directives/keyed.js";
 import { DEFAULT_SIDEBAR_ENTRIES, serializeSidebarEntry } from "../app-navigation.ts";
+import { pathForRoute } from "../app-route-paths.ts";
+import { gatewayPresentationScope } from "../app/gateway-presentation-scope.ts";
 import { isMobileNavLayout } from "../app/mobile-nav-layout.ts";
+import { patchSettings } from "../app/settings.ts";
 import { isUpdateActionable } from "../app/update-schedule-projection.ts";
-import { readPresenceEntries, resolveCurrentSelfUser } from "../app/user-profile.ts";
 import { t } from "../i18n/index.ts";
 import { normalizeAgentLabel } from "../lib/agents/display.ts";
 import { openEditor } from "../lib/editor-links.ts";
@@ -22,18 +24,22 @@ import {
   runSessionNavigationAction,
 } from "../lib/sessions/session-menu-navigation.ts";
 import { showToast } from "../lib/toast.ts";
+import { SETTINGS_ROUTE_TARGETS } from "../pages/config/route-data.ts";
 import {
   pluginSessionMenuActions,
   runControlUiPluginAction,
 } from "../plugins/control-ui-actions.ts";
-import { renderSidebarAgentMenu, renderSidebarIdentityMenu } from "./app-sidebar-agent-menu.ts";
+import { renderSidebarAgentMenu } from "./app-sidebar-agent-menu.ts";
+import { renderSidebarIdentityMenu } from "./app-sidebar-identity-menu.ts";
 import { renderSidebarCustomizeMenu, renderSidebarMoreMenu } from "./app-sidebar-nav-menus.ts";
 import { formatSidebarTimestamp } from "./app-sidebar-session-catalogs.ts";
+import { countSidebarSessionFilters } from "./app-sidebar-session-filter-summary.ts";
 import {
   renderSidebarCatalogViewMenu,
   renderSidebarSessionGroupMenu,
   renderSidebarSessionSortMenu,
 } from "./app-sidebar-session-menu-renderers.ts";
+import { canRetryGatewayStatus } from "./gateway-status.ts";
 import "../styles/sidebar-menus.css";
 import { sessionMenuReasons } from "./session-menu-access.ts";
 import type { SessionMenuAction } from "./session-menu.ts";
@@ -41,9 +47,12 @@ import {
   isSidebarAttentionDismissed,
   isUpdateAttentionForced,
   loadDismissals,
+  resolveSidebarAttentionKey,
   resolveUpdateAttentionDismissal,
 } from "./sidebar-attention-dismissals.ts";
 import type { SidebarMenusController } from "./sidebar-menus-controller.ts";
+
+export { renderSidebarPeopleFilterMenuForController } from "./app-sidebar-people-filter-menu.ts";
 
 export function renderSidebarCustomizeMenuForController(controller: SidebarMenusController) {
   const { host } = controller;
@@ -52,6 +61,14 @@ export function renderSidebarCustomizeMenuForController(controller: SidebarMenus
     return nothing;
   }
   const trigger = controller.customizeMenuTrigger;
+  const toggleEntry = (entry: string) => {
+    const canonical = host.reconciledSidebarZone().sidebarEntries;
+    host.onUpdateSidebarEntries?.(
+      canonical.includes(entry)
+        ? canonical.filter((candidate) => candidate !== entry)
+        : [...canonical, entry],
+    );
+  };
   return renderSidebarCustomizeMenu({
     position,
     sidebarEntries: host.sidebarEntries,
@@ -63,24 +80,11 @@ export function renderSidebarCustomizeMenuForController(controller: SidebarMenus
       if (controller.customizeMenuPosition !== position) {
         return;
       }
-      controller.closeCustomizeMenu({ restoreFocus });
+      controller.closePositionedMenu("customize", { restoreFocus });
     },
-    onToggleRoute: (routeId) => {
-      const entry = serializeSidebarEntry({ type: "route", route: routeId });
-      const canonical = host.reconciledSidebarZone().sidebarEntries;
-      const next = canonical.includes(entry)
-        ? canonical.filter((candidate) => candidate !== entry)
-        : [...canonical, entry];
-      host.onUpdateSidebarEntries?.(next);
-    },
-    onTogglePlugin: (key) => {
-      const entry = serializeSidebarEntry({ type: "plugin", key });
-      const canonical = host.reconciledSidebarZone().sidebarEntries;
-      const next = canonical.includes(entry)
-        ? canonical.filter((candidate) => candidate !== entry)
-        : [...canonical, entry];
-      host.onUpdateSidebarEntries?.(next);
-    },
+    onToggleRoute: (routeId) =>
+      toggleEntry(serializeSidebarEntry({ type: "route", route: routeId })),
+    onTogglePlugin: (key) => toggleEntry(serializeSidebarEntry({ type: "plugin", key })),
     onReset: () => {
       // Canonical list, not the render list: unknown-state session slots
       // (other agents, still-loading caches) must survive a route reset.
@@ -88,7 +92,7 @@ export function renderSidebarCustomizeMenuForController(controller: SidebarMenus
         .reconciledSidebarZone()
         .sidebarEntries.filter((entry) => entry.startsWith("session:"));
       host.onUpdateSidebarEntries?.([...DEFAULT_SIDEBAR_ENTRIES, ...sessions]);
-      controller.closeCustomizeMenu({ restoreFocus: true });
+      controller.closePositionedMenu("customize", { restoreFocus: true });
     },
   });
 }
@@ -104,12 +108,24 @@ export function renderSidebarAgentMenuForController(controller: SidebarMenusCont
   return renderSidebarAgentMenu({
     position,
     basePath: host.basePath,
-    activeId,
-    activeName: normalizeAgentLabel(agent ?? { id: activeId }, identity),
+    activeId: agent ? activeId : "",
+    activeName: agent ? normalizeAgentLabel(agent, identity) : "",
     agents,
     identities,
     pinnedAgentIds: host.pinnedAgentIds,
+    rosterMode: host.sidebarAgentsMode === "roster",
+    onToggleRoster: () => {
+      host.sidebarAgentsMode = host.sidebarAgentsMode === "roster" ? "chip" : "roster";
+      patchSettings({ sidebarAgentsMode: host.sidebarAgentsMode });
+      void host.updateComplete.then(() => {
+        host
+          .querySelector<HTMLElement>(".sidebar-workspace-header__main, .sidebar-agent-card__main")
+          ?.focus();
+      });
+    },
     connected: host.connected,
+    resolveAvatarUrl: (url) => controller.agentMenuAvatars.resolve(url),
+    avatarErrorHandler: (url) => controller.agentMenuAvatars.imageErrorHandler(url),
     openMode: controller.agentMenuInteractionState === "open-hover" ? "hover" : "click",
     agentUnreadCount: (agentId) => host.agentUnreadCount(agentId),
     onPointerEnter: () => controller.handleAgentMenuPointerEnter(),
@@ -135,11 +151,9 @@ export function renderSidebarIdentityMenuForController(controller: SidebarMenusC
     return nothing;
   }
   const trigger = controller.identityMenuTrigger;
-  const selfUser = resolveCurrentSelfUser({
-    snapshotUser: host.sessionDataContext?.gateway.snapshot.selfUser,
-    presenceEntries: readPresenceEntries(host.sessionData.presencePayload),
-    presenceInstanceId: host.sessionData.presenceInstanceId,
-  });
+  const selfUser = host.sessionDataContext
+    ? gatewayPresentationScope(host.sessionDataContext.gateway).displayUser
+    : null;
   const context = host.sessionDataContext;
   const overlaySnapshot = context?.overlays.snapshot;
   const updateAttentionDismissal = resolveUpdateAttentionDismissal({
@@ -160,7 +174,7 @@ export function renderSidebarIdentityMenuForController(controller: SidebarMenusC
     overlaySnapshot?.updateSchedule?.campaign?.state !== "applying" &&
     !isUpdateAttentionForced(overlaySnapshot?.updateStatusBanner?.tone) &&
     isSidebarAttentionDismissed(
-      loadDismissals(context.gateway.connection.gatewayUrl),
+      loadDismissals(resolveSidebarAttentionKey(context.gateway)),
       updateAttentionDismissal,
     ),
   );
@@ -171,7 +185,7 @@ export function renderSidebarIdentityMenuForController(controller: SidebarMenusC
     gatewayVersion: host.gatewayVersion,
     updateAttentionDismissed,
     profileViewer: selfUser ? { ...selfUser, watchedSessions: [] } : undefined,
-    offline: host.offline,
+    canRetryConnection: canRetryGatewayStatus(host.connectionStatus),
     themeMode: host.themeMode,
     triggerWidth: position.width,
     onTabAway: () => trigger?.focus(),
@@ -179,7 +193,7 @@ export function renderSidebarIdentityMenuForController(controller: SidebarMenusC
       if (controller.identityMenuPosition !== position) {
         return;
       }
-      controller.closeIdentityMenu({ restoreFocus });
+      controller.closePositionedMenu("identity", { restoreFocus });
     },
     onNavigate: (routeId, options) => host.onNavigate?.(routeId, options),
     onPairMobile: () => host.onPairMobile?.(),
@@ -255,8 +269,12 @@ export function renderSidebarSessionMenuForController(controller: SidebarMenusCo
           sessionId: session.sessionId ?? null,
           isChild: session.isChild,
           pinned: session.pinned,
+          pinnable: session.pinnable,
           unread: batchRows ? allUnread : session.unread,
+          hiddenFromInvolvingMe: session.hiddenFromInvolvingMe,
           archived: allArchived,
+          snoozedUntil: session.snoozedUntil ?? null,
+          archiving: rows.some((row) => context?.sessions.archiveVisibility(row.key) === "pending"),
           category: batchRows ? sharedCategory : (session.category ?? null),
           icon: batchRows ? null : (session.icon ?? null),
           color: batchRows ? null : (session.color ?? null),
@@ -276,6 +294,7 @@ export function renderSidebarSessionMenuForController(controller: SidebarMenusCo
         .splitAllowed=${canSplitSessionView()}
         .forkDisabled=${host.sessionData.sessionsLoading || session.modelSelectionLocked}
         .forkFromLastCompleted=${session.gatewayHasActiveRun ?? session.hasActiveRun}
+        .snoozeAllowed=${true}
         .archiveAllowed=${archiveAllowed}
         .deleteAllowed=${deleteAllowed}
         .cloudWorkerStopAllowed=${cloudWorkerStopAllowed}
@@ -325,7 +344,19 @@ export function renderSidebarSessionMenuForController(controller: SidebarMenusCo
               }
               break;
             case "toggle-pin":
-              void host.sessionOrganizer.patchSession(session, { pinned: !session.pinned });
+              void host.sessionOrganizer.patchSession(
+                session,
+                { pinned: !session.pinned },
+                {
+                  sessionScope: true,
+                },
+              );
+              break;
+            case "toggle-involving-me":
+              void host.sessionOrganizer.setSessionInvolvement(
+                session,
+                !session.hiddenFromInvolvingMe,
+              );
               break;
             case "toggle-unread":
               void host.sessionOrganizer.patchSession(session, { unread: !session.unread });
@@ -372,9 +403,25 @@ export function renderSidebarSessionMenuForController(controller: SidebarMenusCo
             case "new-group":
               void host.sessionOrganizer.createSessionGroup([session]);
               break;
+            case "snooze":
+              void host.sessionOrganizer.snoozeSessionWithUndo(session, action.snoozedUntil);
+              break;
+            case "wake":
+              void host.sessionOrganizer.patchSession(
+                session,
+                { snoozedUntil: null },
+                { sessionScope: true },
+              );
+              break;
             case "toggle-archived":
               if (session.archived) {
-                void host.sessionOrganizer.patchSession(session, { archived: false });
+                void host.sessionOrganizer.patchSession(
+                  session,
+                  { archived: false },
+                  {
+                    sessionScope: true,
+                  },
+                );
               } else {
                 void host.sessionOrganizer.archiveSessionWithUndo(session);
               }
@@ -401,23 +448,11 @@ export function renderSidebarSessionGroupMenuForController(controller: SidebarMe
     return nothing;
   }
   const groupDefaultsStatus = host.sessionDataContext?.sessions.groupsStatus() ?? "idle";
-  const groupActionAccess = {
-    "group-defaults": readSessionMethodAccess(host.sessionDataContext?.gateway.snapshot, {
-      method: "sessions.groups.update",
-      requiredScope: "operator.write",
-    }),
-    "rename-group": readSessionMethodAccess(host.sessionDataContext?.gateway.snapshot, {
-      method: "sessions.groups.rename",
-      requiredScope: "operator.write",
-    }),
-    "new-group": readSessionMethodAccess(host.sessionDataContext?.gateway.snapshot, {
-      method: "sessions.groups.put",
-      requiredScope: "operator.write",
-    }),
-    "delete-group": readSessionMethodAccess(host.sessionDataContext?.gateway.snapshot, {
-      method: "sessions.groups.delete",
-      requiredScope: "operator.write",
-    }),
+  const groupActionMethods = {
+    "group-defaults": "sessions.groups.update",
+    "rename-group": "sessions.groups.rename",
+    "new-group": "sessions.groups.put",
+    "delete-group": "sessions.groups.delete",
   } as const;
   return renderSidebarSessionGroupMenu({
     menu,
@@ -425,7 +460,11 @@ export function renderSidebarSessionGroupMenuForController(controller: SidebarMe
     connected: host.connected,
     groupDefaultsUnavailable: groupDefaultsStatus === "unavailable",
     actionDisabledReasons: Object.fromEntries(
-      Object.entries(groupActionAccess).flatMap(([action, access]) => {
+      Object.entries(groupActionMethods).flatMap(([action, method]) => {
+        const access = readSessionMethodAccess(host.sessionDataContext?.gateway.snapshot, {
+          method,
+          requiredScope: "operator.write",
+        });
         if (!access.allowed) {
           return [[action, access.reason]];
         }
@@ -473,61 +512,92 @@ export function renderSidebarSessionSortMenuForController(controller: SidebarMen
   if (!position) {
     return nothing;
   }
+  const sessionSources = SETTINGS_ROUTE_TARGETS.sessionSources;
+  const rosterMode = host.sidebarAgentsMode === "roster";
+  const displayedGrouping = host.effectiveSessionsGrouping();
   return renderSidebarSessionSortMenu({
     position,
     trigger: controller.sessionSortMenuTrigger,
-    grouping: host.effectiveSessionsGrouping(),
+    sessionSourcesHref:
+      pathForRoute(sessionSources.routeId, host.basePath) +
+      sessionSources.search +
+      sessionSources.hash,
+    grouping: displayedGrouping,
+    rosterMode,
     sortMode: host.effectiveSessionSortMode(),
     peopleSortAvailable: host.sessionPeopleSortAvailable(),
     statusFilter: host.sessionsStatusFilter,
     showCron: host.sessionsShowCron,
     showPreview: host.sessionsShowPreview,
     showSystem: host.sessionsShowSystem,
-    hideEmptyGroups: host.sessionsHideEmptyGroups,
-    owners: host.sessionOwnershipVisible ? host.sessionOwnerOptions : [],
+    emptyGroupsMode: host.sessionsEmptyGroupsMode,
+    owners: host.sessionOwnershipVisibility.filters ? host.sessionOwnerOptions : [],
     ownerFilterId: host.sessionOwnerFilterActive ? host.sessionOwnerFilterId : null,
     involvingMe: host.sessionInvolvingMeFilterActive,
     selfOwnerId: host.sessionDataContext?.gateway.snapshot.selfUser?.id ?? null,
-    compact: isMobileNavLayout(),
-    view: controller.filterMenuView,
-    onViewChange: (view) => controller.setFilterMenuView(view),
+    // Reset covers the panel; the toolbar dot still counts only Owners and Status.
+    settingsChanged:
+      countSidebarSessionFilters(host) > 0 ||
+      host.sessionsShowCron ||
+      host.sessionsShowSystem ||
+      host.sessionsShowPreview ||
+      host.effectiveSessionSortMode() !== "created" ||
+      (!rosterMode &&
+        (displayedGrouping !== "category" || host.sessionsEmptyGroupsMode !== "filtering")),
+    onReset: () => {
+      host.setSessionOwnerFilter(null);
+      host.sessionOrganizer.setSessionsStatusFilter("active");
+      host.sessionOrganizer.setSessionsShowCron(false);
+      host.sessionOrganizer.setSessionsShowSystem(false);
+      host.sessionOrganizer.setSessionsShowPreview(false);
+      host.setSessionSortMode("created");
+      if (!rosterMode) {
+        // A displayed default can hide a saved Person choice until owners return.
+        if (displayedGrouping !== "category") {
+          host.sessionOrganizer.setSessionsGrouping("category");
+        }
+        host.setSessionsEmptyGroupsMode("filtering");
+      }
+    },
     onGroupingChange: (grouping) => {
       host.sessionOrganizer.setSessionsGrouping(grouping);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
     onSortModeChange: (mode) => {
       host.setSessionSortMode(mode);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
     onStatusFilterChange: (statusFilter) => {
       host.sessionOrganizer.setSessionsStatusFilter(statusFilter);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
     onOwnerFilterChange: (ownerId, involvingMe = false) => {
       host.setSessionOwnerFilter(ownerId, involvingMe);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
     onShowCronChange: (show) => {
       host.sessionOrganizer.setSessionsShowCron(show);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
     onShowPreviewChange: (show) => {
       host.sessionOrganizer.setSessionsShowPreview(show);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
     onShowSystemChange: (show) => {
       host.sessionOrganizer.setSessionsShowSystem(show);
-      controller.closeSessionSortMenu({ restoreFocus: true });
     },
-    onHideEmptyGroupsChange: (hide) => {
-      host.sessionOrganizer.setSessionsHideEmptyGroups(hide);
-      controller.closeSessionSortMenu({ restoreFocus: true });
+    onEmptyGroupsModeChange: (mode) => {
+      if (controller.sessionSortMenuPosition !== position) {
+        return;
+      }
+      host.setSessionsEmptyGroupsMode(mode);
+    },
+    onOpenSessionSources: () => {
+      controller.closePositionedMenu("sessionSort");
+      host.onNavigate?.(sessionSources.routeId, {
+        search: sessionSources.search,
+        hash: sessionSources.hash,
+      });
     },
     onClose: (restoreFocus) => {
       if (controller.sessionSortMenuPosition !== position) {
         return;
       }
-      controller.closeSessionSortMenu({ restoreFocus });
+      controller.closePositionedMenu("sessionSort", { restoreFocus });
     },
   });
 }
@@ -542,7 +612,7 @@ export function renderSidebarCatalogViewMenuForController(controller: SidebarMen
     position,
     trigger: controller.catalogViewMenuTrigger,
     grouping: host.catalogProjectGrouping,
-    owners: host.sessionOwnershipVisible ? host.sessionOwnerOptions : [],
+    owners: host.sessionOwnershipVisibility.filters ? host.sessionOwnerOptions : [],
     ownerFilterId: host.sessionOwnerFilterActive ? host.sessionOwnerFilterId : null,
     involvingMe: host.sessionInvolvingMeFilterActive,
     selfOwnerId: host.sessionDataContext?.gateway.snapshot.selfUser?.id ?? null,
@@ -551,24 +621,24 @@ export function renderSidebarCatalogViewMenuForController(controller: SidebarMen
     onViewChange: (view) => controller.setFilterMenuView(view),
     onGroupingChange: (grouping) => {
       host.setCatalogProjectGrouping(grouping);
-      controller.closeCatalogViewMenu({ restoreFocus: true });
+      controller.closePositionedMenu("catalogView", { restoreFocus: true });
     },
     onHide: () => {
       if (controller.catalogViewMenuPosition !== position) {
         return;
       }
       host.hideSessionCatalog(position.catalogId);
-      controller.closeCatalogViewMenu();
+      controller.closePositionedMenu("catalogView");
     },
     onOwnerFilterChange: (ownerId, involvingMe = false) => {
       host.setSessionOwnerFilter(ownerId, involvingMe);
-      controller.closeCatalogViewMenu({ restoreFocus: true });
+      controller.closePositionedMenu("catalogView", { restoreFocus: true });
     },
     onClose: (restoreFocus) => {
       if (controller.catalogViewMenuPosition !== position) {
         return;
       }
-      controller.closeCatalogViewMenu({ restoreFocus });
+      controller.closePositionedMenu("catalogView", { restoreFocus });
     },
   });
 }
@@ -591,10 +661,10 @@ export function renderSidebarMoreMenuForController(controller: SidebarMenusContr
       if (controller.moreMenuPosition !== position) {
         return;
       }
-      controller.closeMoreMenu({ restoreFocus });
+      controller.closePositionedMenu("more", { restoreFocus });
     },
     onNavigateRoute: (routeId) => {
-      controller.closeMoreMenu({ restoreFocus: true });
+      controller.closePositionedMenu("more", { restoreFocus: true });
       host.onNavigate?.(routeId);
     },
     onPreloadRoute: (routeId, event) => controller.preloadRoute(routeId, event),

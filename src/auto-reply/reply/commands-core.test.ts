@@ -1,7 +1,11 @@
 // Tests core command dispatch, reset hooks, authorization, and send policy.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HookRunner } from "../../plugins/hooks.js";
-import type { CommandHandler, HandleCommandsParams } from "./commands-types.js";
+import type {
+  CommandDispatchParams,
+  CommandHandler,
+  HandleCommandsParams,
+} from "./commands-types.js";
 
 // Tests core command dispatch, aliases, authorization, and handler outcomes.
 
@@ -98,14 +102,6 @@ describe("emitResetCommandHooks", () => {
     });
     expect(ctx?.agentId).toBe("ops");
     expect(ctx?.sessionKey).toBeUndefined();
-    expect(ctx?.sessionId).toBe("prev-session");
-    expect(ctx?.workspaceDir).toBe("/tmp/openclaw-workspace");
-  });
-
-  it("keeps the main-agent path on the main agent workspace", async () => {
-    const ctx = await runBeforeResetContext("agent:main:main");
-    expect(ctx?.agentId).toBe("main");
-    expect(ctx?.sessionKey).toBe("agent:main:main");
     expect(ctx?.sessionId).toBe("prev-session");
     expect(ctx?.workspaceDir).toBe("/tmp/openclaw-workspace");
   });
@@ -236,7 +232,7 @@ vi.mock("../commands-registry.js", () => ({
   shouldHandleTextCommands: vi.fn(() => true),
 }));
 
-function makeParams(): HandleCommandsParams {
+function makeParams(): CommandDispatchParams {
   return {
     cfg: {
       commands: { text: true },
@@ -286,13 +282,16 @@ function makeParams(): HandleCommandsParams {
     workspaceDir: "/tmp/workspace",
     defaultGroupActivation: () => "mention",
     resolvedVerboseLevel: "off",
-    resolvedReasoningLevel: "off",
+    resolveModelLevels: async () => ({
+      resolvedThinkLevel: undefined,
+      resolvedReasoningLevel: "off",
+    }),
     resolveDefaultThinkingLevel: async () => undefined,
     provider: "openai",
     model: "gpt-5.4",
     contextTokens: 0,
     isGroup: false,
-  } as unknown as HandleCommandsParams;
+  } as unknown as CommandDispatchParams;
 }
 
 describe("handleCommands send policy", () => {

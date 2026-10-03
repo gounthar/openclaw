@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { toUSVString } from "node:util";
+import { safeParseJson } from "@openclaw/normalization-core/json-coercion";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { z } from "zod";
 import { inlineAuthProfileCredentialSchema } from "../agents/auth-profiles/credential-schema.js";
 import { coerceProfileUsageStats } from "../agents/auth-profiles/profile-usage-stats.js";
-import type { AuthProfileCredential, ProfileUsageStats } from "../agents/auth-profiles/types.js";
+import type { AuthProfileCredential, UserModelAuthProfile } from "../agents/auth-profiles/types.js";
 import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
@@ -11,7 +14,10 @@ import {
 } from "../infra/kysely-sync.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { SECRET_STORE_VALUE_MAX_BYTES } from "../secrets/store/secret-store-validation-error.js";
-import { withExistingOpenClawStateDatabaseReadOnly } from "./openclaw-state-db-readonly.js";
+import {
+  executeExistingOpenClawStateRead,
+  withExistingOpenClawStateDatabaseReadOnly,
+} from "./openclaw-state-db-readonly.js";
 import { ensureSecretStoreSchema } from "./openclaw-state-db-schema-additive.js";
 import { tableExists } from "./openclaw-state-db-schema-helpers.js";
 import type { DB } from "./openclaw-state-db.generated.js";
@@ -19,8 +25,10 @@ import {
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "./openclaw-state-db.js";
+import { captureOpenClawStateReadWorkerContext } from "./openclaw-state-worker-context.js";
 import { isUserModelAuthProfileId, parseUserModelAuthProfileId } from "./user-model-account-id.js";
-import { selectResolvedUserProfileById } from "./user-profiles-internal.js";
+import { publishUserProfileModelAccountLinksChange } from "./user-profile-events.js";
+import { selectResolvedUserProfile, userProfilesDb } from "./user-profiles-internal.js";
 
 const credentialSchema = inlineAuthProfileCredentialSchema.refine(
   (credential) => credential.copyToAgents !== true,
@@ -41,11 +49,6 @@ const profileSchema = z.strictObject({
 type UserModelLinks = z.infer<typeof linksSchema>;
 type AccountRecordName = "model-accounts" | `model-account:${string}`;
 
-export type UserModelAuthProfile = {
-  credential: AuthProfileCredential;
-  usageStats?: ProfileUsageStats;
-};
-
 export type UserProfileAuthLink = { provider: string; authProfileId: string; updatedAt: number };
 export type UserModelAccount = {
   authProfileId: string;
@@ -65,13 +68,7 @@ function parseRecord<T>(value: string, schema: z.ZodType<T>): T {
   if (Buffer.byteLength(value, "utf8") > SECRET_STORE_VALUE_MAX_BYTES) {
     throw invalidAccounts();
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw invalidAccounts();
-  }
-  const result = schema.safeParse(parsed);
+  const result = schema.safeParse(safeParseJson(value));
   if (!result.success) {
     throw invalidAccounts();
   }
@@ -82,7 +79,11 @@ function resolveOwner(db: DatabaseSync, profileId: string): string | undefined {
   if (!tableExists(db, "user_profiles")) {
     return undefined;
   }
-  const profile = selectResolvedUserProfileById(db, profileId);
+  const profile = selectResolvedUserProfile(
+    db,
+    profileId,
+    userProfilesDb(db).selectFrom("user_profiles").select(["id", "merged_into"]),
+  );
   // Profile display reads may return a stranded tombstone; it cannot own secrets.
   return profile && !profile.merged_into ? profile.id : undefined;
 }
@@ -161,6 +162,7 @@ function readLinks(db: DatabaseSync, owner: string): UserModelLinks {
 
 function writeLinks(db: DatabaseSync, owner: string, links: UserModelLinks): void {
   writeRecord(db, owner, "model-accounts", JSON.stringify(linksSchema.parse(links)));
+  publishUserProfileModelAccountLinksChange(db, owner);
 }
 
 function readProfile(
@@ -176,6 +178,12 @@ function readProfile(
     return undefined;
   }
   const { credential, usageStats } = parseRecord(raw, profileSchema);
+  registerUserModelAuthProfileSecrets(credential);
+  return { credential, usageStats };
+}
+
+// Redaction is process-local; both native reads and host message results register secrets.
+export function registerUserModelAuthProfileSecrets(credential: AuthProfileCredential): void {
   if (credential.type === "oauth") {
     registerSecretValueForRedaction(credential.access);
     registerSecretValueForRedaction(credential.refresh);
@@ -183,11 +191,12 @@ function readProfile(
       registerSecretValueForRedaction(credential.idToken);
     }
   } else if (credential.type === "token") {
-    registerSecretValueForRedaction(credential.token);
-  } else {
+    if (credential.token !== undefined) {
+      registerSecretValueForRedaction(credential.token);
+    }
+  } else if (credential.key !== undefined) {
     registerSecretValueForRedaction(credential.key);
   }
-  return { credential, usageStats };
 }
 
 function writeProfile(
@@ -248,14 +257,14 @@ function accountSummary(
   links: UserModelLinks,
 ): UserModelAccount {
   const { credential } = parseRecord(value, profileSchema);
+  const identity = [credential.email?.trim(), credential.displayName?.trim()].filter(Boolean);
   return {
     authProfileId,
     provider: credential.provider,
-    label: (
-      credential.displayName?.trim() ||
-      credential.email?.trim() ||
-      credential.provider
-    ).slice(0, 256),
+    label: truncateUtf16Safe(
+      toUSVString([...new Set(identity)].join(" · ") || credential.provider),
+      256,
+    ),
     authType: credential.type,
     selected: links.links[credential.provider]?.authProfileId === authProfileId,
   };
@@ -411,11 +420,36 @@ export function listUserProfileAuthLinks(
   options: OpenClawStateDatabaseOptions = {},
 ): UserProfileAuthLink[] {
   return (
-    withExistingOpenClawStateDatabaseReadOnly(({ db }) => {
-      const owner = resolveOwner(db, profileId);
-      return owner ? accountLinks(readLinks(db, owner)) : [];
-    }, options) ?? []
+    withExistingOpenClawStateDatabaseReadOnly(
+      ({ db }) => listUserProfileAuthLinksInDatabase(db, profileId),
+      options,
+    ) ?? []
   );
+}
+
+export function listUserProfileAuthLinksInDatabase(
+  db: DatabaseSync,
+  profileId: string,
+): UserProfileAuthLink[] {
+  const owner = resolveOwner(db, profileId);
+  return owner ? accountLinks(readLinks(db, owner)) : [];
+}
+
+/** Fresh private account selections are read on the shared-state reader, never the Gateway thread. */
+export async function listUserProfileAuthLinksAsync(
+  profileId: string,
+  options: Pick<OpenClawStateDatabaseOptions, "path" | "env"> = {},
+): Promise<UserProfileAuthLink[]> {
+  const context = captureOpenClawStateReadWorkerContext(options);
+  const reply = await executeExistingOpenClawStateRead(
+    { path: context.admission.databasePath, env: context.environment },
+    { type: "userModelAccounts.links", profileId },
+    { context, current: true, preferIndependentWarmRead: true },
+  );
+  if (reply && (!reply.ok || reply.type !== "userModelAccounts.links")) {
+    throw new Error(reply.ok ? "Unexpected model account links reply" : reply.message);
+  }
+  return reply?.links ?? [];
 }
 
 export function resolveUserProfileAuthLink(
@@ -430,6 +464,76 @@ export function resolveUserProfileAuthLink(
     }
   }
   return undefined;
+}
+
+/** Apply Doctor's verified credential renames without changing account selections or ownership. */
+export function renameUserProfileAuthLinks(
+  profileIdMap: ReadonlyMap<string, string>,
+  options: OpenClawStateDatabaseOptions = {},
+): number {
+  if (profileIdMap.size === 0) {
+    return 0;
+  }
+  return runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      if (!tableExists(db, "secret_store_entries")) {
+        return 0;
+      }
+      const query = getNodeSqliteKysely<Pick<DB, "secret_store_entries">>(db);
+      const rows = executeSqliteQuerySync(
+        db,
+        query
+          .selectFrom("secret_store_entries")
+          .select("scope_id")
+          .where("scope_kind", "=", "identity")
+          .where("name", "=", "model-accounts")
+          .where("deleted_at_ms", "is", null),
+      ).rows;
+      const replacements: Array<{ owner: string; value: string }> = [];
+      for (const row of rows) {
+        // Merge owns aliases and stranded secrets; a rename must not revive or transfer them.
+        if (resolveOwner(db, row.scope_id) !== row.scope_id) {
+          continue;
+        }
+        const record = readLinks(db, row.scope_id);
+        let changed = false;
+        for (const link of Object.values(record.links)) {
+          if (!link) {
+            continue;
+          }
+          const renamed = profileIdMap.get(link.authProfileId);
+          if (renamed !== undefined && renamed !== link.authProfileId) {
+            link.authProfileId = renamed;
+            changed = true;
+          }
+        }
+        if (changed) {
+          const value = JSON.stringify(record);
+          parseRecord(value, linksSchema);
+          replacements.push({ owner: row.scope_id, value });
+        }
+      }
+      // All records are valid before the first write; changing only value preserves selection metadata.
+      for (const { owner, value } of replacements) {
+        executeSqliteQuerySync(
+          db,
+          query
+            .updateTable("secret_store_entries")
+            .set({ value })
+            .where("scope_kind", "=", "identity")
+            .where("scope_id", "=", owner)
+            .where("name", "=", "model-accounts")
+            .where("deleted_at_ms", "is", null),
+        );
+      }
+      for (const { owner } of replacements) {
+        publishUserProfileModelAccountLinksChange(db, owner);
+      }
+      return replacements.length;
+    },
+    options,
+    { operationLabel: "users.model-accounts.rename-auth-profiles" },
+  );
 }
 
 export function setUserProfileAuthLink(
@@ -551,4 +655,5 @@ export function mergeUserModelAccounts(db: DatabaseSync, source: string, target:
         eb.or([eb("name", "=", "model-accounts"), eb("name", "like", "model-account:%")]),
       ),
   );
+  publishUserProfileModelAccountLinksChange(db, source, target);
 }

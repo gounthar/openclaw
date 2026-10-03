@@ -8,10 +8,7 @@ import { recordPluginCandidateInstallOwner } from "./candidate-install-owner.js"
 import type { PluginCandidate } from "./discovery.js";
 import { resolveInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
 import { buildInstalledPluginIndexRecords } from "./installed-plugin-index-record-builder.js";
-import {
-  loadInstalledPluginIndexInstallRecordsSync,
-  writePersistedInstalledPluginIndexInstallRecords,
-} from "./installed-plugin-index-records.js";
+import { loadInstalledPluginIndexInstallRecordsSync } from "./installed-plugin-index-records.js";
 import {
   diffInstalledPluginIndexInvalidationReasons,
   isInstalledPluginEnabled,
@@ -23,6 +20,7 @@ import type { PluginManifestRecord } from "./manifest-registry.js";
 import type { OpenClawPackageManifest } from "./manifest.js";
 import { createPluginCache, withPluginCache } from "./plugin-cache.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
+import { seedInstalledPluginIndex } from "./test-helpers/installed-plugin-index.js";
 
 vi.unmock("../version.js");
 
@@ -250,7 +248,6 @@ describe("installed plugin index", () => {
     });
     expectSha256(packageJson.hash);
     expect(resolveInstalledPluginIndexInstallOwner(plugin)).toBeUndefined();
-    expect(index.plugins[0]?.installRecord).toBeUndefined();
     expect(index.plugins[0]?.installRecordHash).toBeUndefined();
   });
 
@@ -524,26 +521,37 @@ describe("installed plugin index", () => {
     },
   );
 
-  it("evaluates current enablement without retaining removed startup policy", () => {
+  it("retains disabled plugin metadata while evaluating live enablement", () => {
     const enabledFixture = createRichPluginFixture({ id: "enabled-demo" });
     const disabledFixture = createRichPluginFixture({ id: "disabled-demo" });
-    const index = loadInstalledPluginIndex({
-      candidates: [enabledFixture.candidate, disabledFixture.candidate],
-      config: {
-        plugins: {
-          entries: {
-            "disabled-demo": {
-              enabled: false,
-            },
+    const config = {
+      plugins: {
+        entries: {
+          "disabled-demo": {
+            enabled: false,
           },
         },
       },
+    };
+    const index = loadInstalledPluginIndex({
+      candidates: [enabledFixture.candidate, disabledFixture.candidate],
+      config,
       env: hermeticEnv(),
     });
 
-    expect(index.plugins.find((plugin) => plugin.pluginId === "disabled-demo")?.enabled).toBe(
-      false,
+    const disabled = index.plugins.find((plugin) => plugin.pluginId === "disabled-demo");
+    expect(disabled?.enabled).toBe(false);
+    expect(disabled?.contributions).toEqual(
+      expect.objectContaining({
+        channels: ["demo-chat"],
+        channelConfigs: ["demo-chat"],
+        providers: ["demo"],
+        modelCatalogProviders: ["demo"],
+        commandAliases: ["demo-command"],
+        contracts: { tools: ["demo-tool"] },
+      }),
     );
+    expect(isInstalledPluginEnabled(index, "disabled-demo", config)).toBe(false);
     expect(
       isInstalledPluginEnabled(index, "disabled-demo", {
         plugins: {
@@ -636,7 +644,6 @@ describe("installed plugin index", () => {
         pinState: "exact-with-integrity",
       },
     );
-    expect(index.plugins[0]?.installRecord).toBeUndefined();
     expect(index.plugins[0]?.installRecordHash).toMatch(/^[a-f0-9]{64}$/u);
   });
 
@@ -745,7 +752,7 @@ describe("installed plugin index", () => {
   it("indexes persisted plugin index records from an explicit state directory", async () => {
     const fixture = createRichPluginFixture({ installOwner: "demo" });
     const stateDir = makeTempDir();
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         demo: {
           source: "npm",
@@ -786,7 +793,7 @@ describe("installed plugin index", () => {
   it("discovers installed plugin packages from persisted install records", async () => {
     const fixture = createRichPluginFixture();
     const stateDir = makeTempDir();
-    await writePersistedInstalledPluginIndexInstallRecords(
+    await seedInstalledPluginIndex(
       {
         demo: {
           source: "git",
@@ -1024,37 +1031,6 @@ describe("installed plugin index", () => {
     expect(diffInstalledPluginIndexInvalidationReasons(migratedEnabledOnly, current)).toStrictEqual(
       [],
     );
-  });
-
-  it("marks disabled plugins without dropping their cold contributions", () => {
-    const fixture = createRichPluginFixture();
-
-    const index = loadInstalledPluginIndex({
-      candidates: [fixture.candidate],
-      config: {
-        plugins: {
-          entries: {
-            demo: {
-              enabled: false,
-            },
-          },
-        },
-      },
-      env: hermeticEnv(),
-    });
-
-    expect(
-      isInstalledPluginEnabled(index, "demo", {
-        plugins: {
-          entries: {
-            demo: {
-              enabled: false,
-            },
-          },
-        },
-      }),
-    ).toBe(false);
-    expect(index.plugins[0]?.enabled).toBe(false);
   });
 
   it("tracks refresh reason without using the manifest cache", () => {

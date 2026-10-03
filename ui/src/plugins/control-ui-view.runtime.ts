@@ -5,6 +5,7 @@ import { property, state } from "lit/decorators.js";
 import { keyed } from "lit/directives/keyed.js";
 import type {
   ControlUiAction,
+  ControlUiSession,
   ControlUiSurface,
   ControlUiSurfaceProps,
   ControlUiView,
@@ -32,19 +33,20 @@ class ControlUiPluginView extends OpenClawLightDomContentsElement {
   @property({ attribute: false }) surface: ControlUiSurface = "workspace";
   @property({ attribute: false }) props: unknown = {};
   @property({ attribute: false }) defaultView: unknown = nothing;
+  @property({ attribute: false }) replacementCompanion: unknown = nothing;
   @property({ attribute: false }) defaultHost?: LitElement;
   @property({ type: Boolean }) presented = true;
   @state() private error = "";
   private registration?: ViewRegistration;
   private mountAbort?: AbortController;
   private mountGeneration = 0;
+  private composerGeneration = 0;
   private ownerChanged = false;
   private handle?: ReturnType<ControlUiView<unknown>>;
   private viewContext?: ControlUiViewContext<unknown>;
   private readonly defaultContainers = new Set<HTMLElement>();
-  private readonly subscriptions = new SubscriptionsController(this).watch(
+  private readonly subscriptions = new SubscriptionsController(this).watchStore(
     () => this.context?.plugins,
-    (plugins, notify) => plugins.subscribe(notify),
     () => {
       const next = this.resolveRegistration();
       if (this.registration?.value !== next?.value || this.registration?.signal !== next?.signal) {
@@ -69,6 +71,10 @@ class ControlUiPluginView extends OpenClawLightDomContentsElement {
 
   override requestUpdate(...args: Parameters<OpenClawLightDomContentsElement["requestUpdate"]>) {
     const [name, previous] = args;
+    if (name === "presented" && this.presented !== previous) {
+      // Retention preserves the view host, but old composer operations must never revive.
+      this.composerGeneration += 1;
+    }
     if (name === "props") {
       // SAFETY: host renderers supply props records; plugin page props may omit session identity.
       const before = previous as Partial<BoardGetParams> | undefined;
@@ -136,11 +142,20 @@ class ControlUiPluginView extends OpenClawLightDomContentsElement {
             if (abort.signal.aborted) {
               throw new Error("This plugin UI view has ended.");
             }
+            const firstDefault = this.defaultContainers.size === 0;
             this.defaultContainers.add(target);
             render(this.defaultView, target, { host: this.defaultHost ?? this });
+            if (firstDefault) {
+              this.requestUpdate();
+            }
             return () => {
-              this.defaultContainers.delete(target);
+              if (!this.defaultContainers.delete(target)) {
+                return;
+              }
               render(nothing, target);
+              if (this.defaultContainers.size === 0) {
+                this.requestUpdate();
+              }
             };
           },
         };
@@ -167,8 +182,14 @@ class ControlUiPluginView extends OpenClawLightDomContentsElement {
     }
     // SAFETY: renderPluginSurface supplies composer props only for the discriminants checked above.
     const props = this.props as ControlUiSurfaceProps["composer"];
+    const generation = this.composerGeneration;
     const check = () => {
-      if (signal.aborted || this.registration?.signal.aborted) {
+      if (
+        !this.presented ||
+        generation !== this.composerGeneration ||
+        signal.aborted ||
+        this.registration?.signal.aborted
+      ) {
         throw new Error("This plugin UI view has ended.");
       }
     };
@@ -261,10 +282,11 @@ class ControlUiPluginView extends OpenClawLightDomContentsElement {
     }
     // The host owns the mount root. A new lifetime gets new DOM even when the
     // plugin has no disposer or its framework caches render state on the root.
-    return keyed(
+    // A delegated built-in already owns these controls, as does failure fallback above.
+    return html`${this.defaultContainers.size === 0 ? this.replacementCompanion : nothing}${keyed(
       this.mountGeneration,
       html`<div data-plugin-view-root style="display: contents"></div>`,
-    );
+    )}`;
   }
 }
 
@@ -279,20 +301,19 @@ class ControlUiPluginContributions extends OpenClawLightDomContentsElement {
     "navigation";
   @property({ attribute: false }) sessionKey = "";
   @property({ attribute: false }) agentId?: string;
+  @property({ attribute: false }) session?: ControlUiSession;
   @property({ attribute: false }) navigationKey = "";
-  @property({ attribute: false }) excludedNavigationKeys: readonly string[] = [];
   @property({ type: Boolean }) presented = true;
   @state() private actionError = "";
   private readonly subscriptions = new SubscriptionsController(this)
-    .watch(
+    .watchStore(
       () => this.context?.plugins,
-      (plugins, notify) => plugins.subscribe(notify),
       () => this.retireHiddenActions(),
     )
-    .watch(
+    .watchStore(() => (this.kind === "navigation" ? this.context?.router : undefined))
+    .watchStore(
       () =>
         this.kind === "header" || this.kind === "composer" ? this.context?.sessions : undefined,
-      (sessions, notify) => sessions.subscribe(notify),
       () => this.retireHiddenActions(),
     );
 
@@ -369,19 +390,16 @@ class ControlUiPluginContributions extends OpenClawLightDomContentsElement {
     if (this.kind === "navigation") {
       return runtime
         .registrations("navigation")
-        .filter((entry) =>
-          this.navigationKey
-            ? entry.key === this.navigationKey
-            : entry.value.defaultVisible !== false &&
-              !this.excludedNavigationKeys.includes(entry.key),
-        )
-        .toSorted(
-          (a, b) => (a.value.order ?? 0) - (b.value.order ?? 0) || a.key.localeCompare(b.key),
-        )
+        .filter((entry) => entry.key === this.navigationKey)
         .map((entry) => {
           const href = entry.host.navigation.pageHref(entry.value.page);
-          const active = href === `${window.location.pathname}${window.location.search}`;
-          let icon: IconName = "puzzle";
+          const target = new URL(href, window.location.href);
+          const search = new URLSearchParams(window.location.search);
+          // Extra page filters do not change the destination; explicit target params do.
+          const active =
+            target.pathname === window.location.pathname &&
+            [...target.searchParams].every(([key, value]) => search.get(key) === value);
+          let icon: IconName = "plug";
           if (entry.value.icon && Object.hasOwn(icons, entry.value.icon)) {
             // SAFETY: the own-key check narrows this plugin-provided name to the icon registry.
             icon = entry.value.icon as IconName;
@@ -410,7 +428,7 @@ class ControlUiPluginContributions extends OpenClawLightDomContentsElement {
           renderPluginContribution(
             "accessories",
             entry.key,
-            { sessionKey: this.sessionKey, agentId: this.agentId },
+            { sessionKey: this.sessionKey, agentId: this.agentId, session: this.session },
             nothing,
             this.presented,
           ),

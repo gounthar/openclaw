@@ -1,6 +1,6 @@
 // Doctor-only import for the retired ACP replay JSON ledger.
 import { createHash } from "node:crypto";
-import fsSync from "node:fs";
+import fsSync, { type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -17,6 +17,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
 } from "./kysely-sync.js";
+import { legacyMigrationSourceSnapshotsMatch as sourceIdentityMatches } from "./state-migrations.source-snapshot.js";
 import type { LegacyStateDetection, MigrationMessages } from "./state-migrations.types.js";
 
 const LEGACY_LEDGER_VERSION = 1;
@@ -32,33 +33,7 @@ const LEGACY_LEDGER_LOCK_OPTIONS = {
   staleRecovery: "fail-closed",
 } as const;
 
-type LegacyAcpReplayEvent = {
-  seq: number;
-  at: number;
-  sessionId: string;
-  sessionKey: string;
-  runId?: string;
-  update: SessionUpdate;
-};
-
-type LegacyAcpReplaySession = {
-  sessionId: string;
-  sessionKey: string;
-  cwd: string;
-  complete: boolean;
-  createdAt: number;
-  updatedAt: number;
-  nextSeq: number;
-  events: LegacyAcpReplayEvent[];
-};
-
-type LegacySourceIdentity = {
-  dev: number | bigint;
-  ino: number | bigint;
-  mtimeMs: number | bigint;
-  sha256: string;
-  size: number | bigint;
-};
+type LegacyAcpReplaySession = ReturnType<typeof parseLegacySession>;
 
 type AcpReplayMigrationDatabase = Pick<
   OpenClawStateKyselyDatabase,
@@ -98,10 +73,6 @@ const legacyAcpReplayLedgerSchema = z.looseObject({
   sessions: legacyAcpReplayRecordSchema,
 });
 
-function resolveLegacyAcpReplayLedgerPath(stateDir: string): string {
-  return path.join(stateDir, "acp", "event-ledger.json");
-}
-
 function resolveLegacyAcpReplayClaimPath(sourcePath: string): string {
   return `${sourcePath}.doctor-import`;
 }
@@ -111,7 +82,7 @@ export function detectLegacyAcpReplayLedger(params: {
   stateDir: string;
   doctorOnlyStateMigrations?: boolean;
 }): LegacyStateDetection["acpReplayLedger"] {
-  const sourcePath = resolveLegacyAcpReplayLedgerPath(params.stateDir);
+  const sourcePath = path.join(params.stateDir, "acp", "event-ledger.json");
   const claimPath = resolveLegacyAcpReplayClaimPath(sourcePath);
   return {
     sourcePath,
@@ -121,7 +92,7 @@ export function detectLegacyAcpReplayLedger(params: {
   };
 }
 
-function parseLegacyEvent(raw: unknown, sessionId: string): LegacyAcpReplayEvent {
+function parseLegacyEvent(raw: unknown, sessionId: string) {
   const parsed = legacyAcpReplayEventSchema.safeParse(raw);
   if (!parsed.success || parsed.data.sessionId !== sessionId) {
     throw new Error(`legacy ACP replay session ${sessionId} contains an invalid event`);
@@ -140,7 +111,7 @@ function parseLegacyEvent(raw: unknown, sessionId: string): LegacyAcpReplayEvent
   };
 }
 
-function parseLegacySession(raw: unknown, expectedSessionId: string): LegacyAcpReplaySession {
+function parseLegacySession(raw: unknown, expectedSessionId: string) {
   const parsed = legacyAcpReplaySessionSchema.safeParse(raw);
   if (!parsed.success || parsed.data.sessionId !== expectedSessionId) {
     throw new Error(`legacy ACP replay session ${expectedSessionId} is invalid`);
@@ -174,10 +145,7 @@ function parseLegacyLedger(raw: string): LegacyAcpReplaySession[] {
   );
 }
 
-function sourceIdentity(
-  stat: Awaited<ReturnType<typeof fs.lstat>>,
-  raw: string,
-): LegacySourceIdentity {
+function sourceIdentity(stat: Stats, raw: string) {
   return {
     dev: stat.dev,
     ino: stat.ino,
@@ -185,16 +153,6 @@ function sourceIdentity(
     sha256: createHash("sha256").update(raw).digest("hex"),
     size: stat.size,
   };
-}
-
-function sourceIdentityMatches(left: LegacySourceIdentity, right: LegacySourceIdentity): boolean {
-  return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.mtimeMs === right.mtimeMs &&
-    left.sha256 === right.sha256 &&
-    left.size === right.size
-  );
 }
 
 function reconcileCanonicalSession(db: DatabaseSync, session: LegacyAcpReplaySession): boolean {

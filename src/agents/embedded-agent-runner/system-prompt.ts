@@ -5,11 +5,11 @@ import type { ChatType } from "../../channels/chat-type.js";
 import type { AgentTool } from "../runtime/index.js";
 import type { AgentSession } from "../sessions/index.js";
 import { buildConfiguredAgentSystemPrompt } from "../system-prompt-config.js";
-import type { SystemPromptRuntimeInfo } from "../system-prompt.js";
+import type { SystemPromptRuntimeInfo } from "../system-prompt.types.js";
 
 type EmbeddedSystemPromptParams = Omit<
   Parameters<typeof buildConfiguredAgentSystemPrompt>[0],
-  "toolNames" | "toolSummaries" | "fsWorkspaceOnly"
+  "toolNames" | "fsWorkspaceOnly" | "messageTool"
 > & {
   reasoningTagHint: boolean;
   runtimeInfo: SystemPromptRuntimeInfo & {
@@ -20,8 +20,6 @@ type EmbeddedSystemPromptParams = Omit<
     model: string;
     provider?: string;
     chatType?: ChatType;
-    /** Supported message actions for the current channel (e.g., react, edit, unsend) */
-    channelActions?: string[];
   };
   tools: AgentTool[];
   userTimezone: string;
@@ -34,6 +32,7 @@ export function buildEmbeddedSystemPrompt(params: EmbeddedSystemPromptParams): s
     ...promptParams,
     agentId: params.agentId ?? params.runtimeInfo.agentId,
     toolNames: tools.map((tool) => tool.name),
+    messageTool: tools.find((tool) => tool.name.trim().toLowerCase() === "message"),
   });
 }
 

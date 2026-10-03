@@ -1,6 +1,8 @@
 // Voice Call tests cover stale-call reaping through a real provider HTTP boundary.
 import type { ServerResponse } from "node:http";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+import { createTestPluginServiceScheduler } from "openclaw/plugin-sdk/plugin-test-api";
 import { withFetchPreconnect, withServer } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { endCall } from "../manager/outbound.js";
@@ -37,7 +39,7 @@ describe("stale-call reaper provider transport", () => {
   it("keeps one Telnyx hangup in flight, then retries after the provider timeout", async () => {
     vi.useFakeTimers({
       // Voice provider requests use buildTimeoutAbortSignal's setTimeout timer.
-      toFake: ["Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"],
+      toFake: ["performance", "Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"],
     });
     vi.setSystemTime(new Date("2026-07-15T12:00:00.000Z"));
 
@@ -86,6 +88,7 @@ describe("stale-call reaper provider transport", () => {
           processedEventIds: [],
         } satisfies CallRecord;
         const context: Parameters<typeof endCall>[0] = {
+          mutationQueue: new KeyedAsyncQueue(),
           activeCalls: new Map([[call.callId, call]]),
           providerCallIdMap: new Map([[call.providerCallId, call.callId]]),
           provider,
@@ -100,6 +103,7 @@ describe("stale-call reaper provider transport", () => {
         };
 
         const stop = startStaleCallReaper({
+          scheduler: createTestPluginServiceScheduler(),
           manager,
           staleCallReaperSeconds: 60,
         });
@@ -143,7 +147,7 @@ describe("stale-call reaper provider transport", () => {
         });
         expect(transport).toHaveBeenCalledTimes(2);
 
-        stop?.();
+        await stop?.();
       },
     );
   });

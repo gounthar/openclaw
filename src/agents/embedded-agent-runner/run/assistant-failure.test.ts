@@ -9,14 +9,17 @@ import {
   PROVIDER_POST_DISPATCH_AMBIGUITY_ERROR_CODE,
 } from "../../../llm/types.js";
 import { buildAgentRunTerminalOutcomeFromLifecycleEvent } from "../../agent-run-terminal-outcome.js";
+import { createApiKeyCredential } from "../../auth-profiles/credential-fixtures.test-support.js";
 import { classifyAssistantFailoverReason } from "../../embedded-agent-helpers/assistant-message-failures.js";
 import { FailoverError } from "../../failover-error.js";
 import { runWithModelFallback } from "../../model-fallback-runner.js";
 import { resolveAgentRunErrorLifecycleFields } from "../../run-termination.js";
 import {
   buildEmbeddedRunnerAssistant,
+  createMockUsage,
   makeEmbeddedRunnerAttempt,
 } from "../../test-helpers/embedded-agent-runner-e2e-fixtures.js";
+import { createModelFallbackConfig } from "../../test-helpers/model-fallback-config-fixture.js";
 import { handleEmbeddedAssistantFailure } from "./assistant-failure.js";
 import { resolveEmbeddedRunAttemptTerminalState } from "./terminal-outcome.js";
 
@@ -79,16 +82,8 @@ function makeExhaustedCredentialFailureInput(options?: { replaySafe?: boolean })
     authProfileStore: {
       version: 1,
       profiles: {
-        "anthropic:p1": {
-          type: "api_key",
-          provider: "anthropic",
-          key: "test-key",
-        },
-        "anthropic:p2": {
-          type: "api_key",
-          provider: "anthropic",
-          key: "test-key-2",
-        },
+        "anthropic:p1": createApiKeyCredential("anthropic", "test-key"),
+        "anthropic:p2": createApiKeyCredential("anthropic", "test-key-2"),
       },
       usageStats: {
         "anthropic:p1": { lastUsed: 1 },
@@ -440,16 +435,9 @@ describe("handleEmbeddedAssistantFailure", () => {
   it("recovers a real loopback Mistral partial EOF through embedded model fallback", async () => {
     const { assistant, partialText } = await streamIncompleteMistralResponseOverLoopback();
     const classification = classifyAssistantFailoverReason(assistant);
-    const config = {
-      agents: {
-        defaults: {
-          model: {
-            primary: "mistral/mistral-large-latest",
-            fallbacks: ["google/mock-2"],
-          },
-        },
-      },
-    } satisfies OpenClawConfig;
+    const config = createModelFallbackConfig("mistral/mistral-large-latest", [
+      "google/mock-2",
+    ]) satisfies OpenClawConfig;
     const calls: string[] = [];
     let embeddedFailure: { reason: string; rawError?: string } | undefined;
     let embeddedTrace: AssistantFailureInput["traceAttempts"] = [];
@@ -760,20 +748,163 @@ describe("handleEmbeddedAssistantFailure", () => {
     expect(fixture.traceAttempts).toEqual([]);
   });
 
+  it("retries a blank runtime failure and advances to fallback when its budget is spent", async () => {
+    const fixture = makeExhaustedCredentialFailureInput();
+    const assistant = buildEmbeddedRunnerAssistant({
+      api: "github-copilot",
+      provider: "anthropic",
+      model: "mock-1",
+      stopReason: "error",
+      errorMessage: "No API provider registered for api: github-copilot",
+      content: [{ type: "text", text: "" }],
+      usage: createMockUsage(0, 0),
+    });
+    const attempt = makeEmbeddedRunnerAttempt({
+      lastAssistant: assistant,
+      currentAttemptAssistant: assistant,
+      currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+    });
+    fixture.input.attempt = attempt;
+    fixture.input.attemptAssistant = assistant;
+    fixture.input.currentAttemptAssistant = assistant;
+    fixture.input.terminalState = resolveEmbeddedRunAttemptTerminalState({ attempt, assistant });
+    fixture.input.emptyErrorRetries = 0;
+
+    await expect(handleEmbeddedAssistantFailure(fixture.input)).resolves.toMatchObject({
+      action: "retry",
+      emptyErrorRetries: 1,
+    });
+
+    fixture.input.emptyErrorRetries = 3;
+    await expect(handleEmbeddedAssistantFailure(fixture.input)).rejects.toMatchObject({
+      reason: "unknown",
+      provider: "anthropic",
+      model: "mock-1",
+      rawError: assistant.errorMessage,
+    });
+    expect(fixture.advanceAuthProfile).not.toHaveBeenCalled();
+  });
+
+  it("retries a pre-dispatch tool-call rejection whose content was discarded", async () => {
+    // Buffered Anthropic rejection leaves empty content with positive output usage.
+    const fixture = makeExhaustedCredentialFailureInput();
+    const assistant = buildEmbeddedRunnerAssistant({
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-opus-5",
+      stopReason: "error",
+      errorMessage: "Provider completed tool call with malformed JSON arguments",
+      content: [],
+      usage: createMockUsage(640, 1329),
+    });
+    const attempt = makeEmbeddedRunnerAttempt({
+      assistantTexts: [],
+      lastAssistant: assistant,
+      currentAttemptAssistant: assistant,
+      currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+    });
+    fixture.input.attempt = attempt;
+    fixture.input.attemptAssistant = assistant;
+    fixture.input.currentAttemptAssistant = assistant;
+    fixture.input.terminalState = resolveEmbeddedRunAttemptTerminalState({ attempt, assistant });
+    fixture.input.emptyErrorRetries = 0;
+    fixture.input.maybeRefreshRuntimeAuthForAuthError = vi.fn(async () => true);
+
+    const outcome = await handleEmbeddedAssistantFailure(fixture.input);
+
+    expect(outcome).toMatchObject({
+      action: "retry",
+      emptyErrorRetries: 1,
+    });
+    expect(fixture.input.maybeRefreshRuntimeAuthForAuthError).not.toHaveBeenCalled();
+    expect(fixture.advanceAuthProfile).not.toHaveBeenCalled();
+    expect(fixture.traceAttempts).toEqual([]);
+  });
+
+  it("stops retrying a pre-dispatch tool-call rejection once the bounded budget is spent", async () => {
+    const fixture = makeExhaustedCredentialFailureInput();
+    const assistant = buildEmbeddedRunnerAssistant({
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-opus-5",
+      stopReason: "error",
+      errorMessage: "Provider completed tool call with malformed JSON arguments",
+      content: [],
+      usage: createMockUsage(640, 1329),
+    });
+    const attempt = makeEmbeddedRunnerAttempt({
+      assistantTexts: [],
+      lastAssistant: assistant,
+      currentAttemptAssistant: assistant,
+      currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+    });
+    fixture.input.attempt = attempt;
+    fixture.input.attemptAssistant = assistant;
+    fixture.input.currentAttemptAssistant = assistant;
+    fixture.input.terminalState = resolveEmbeddedRunAttemptTerminalState({ attempt, assistant });
+    fixture.input.emptyErrorRetries = 3;
+    fixture.input.fallbackConfigured = false;
+    fixture.input.maybeRefreshRuntimeAuthForAuthError = vi.fn(async () => true);
+
+    const outcome = await handleEmbeddedAssistantFailure(fixture.input);
+
+    expect(outcome.action).toBe("proceed");
+    expect(outcome.emptyErrorRetries).toBe(3);
+  });
+
+  it("hands a pre-dispatch tool-call rejection to the configured fallback model once retries are spent", async () => {
+    // A model that keeps emitting the same unparseable call exhausts the bounded
+    // resubmits; with a fallback chain configured the run moves to the next model
+    // instead of surfacing the rejection.
+    const fixture = makeExhaustedCredentialFailureInput();
+    const assistant = buildEmbeddedRunnerAssistant({
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "mock-1",
+      stopReason: "error",
+      errorMessage: "Provider completed tool call with malformed JSON arguments",
+      content: [],
+      usage: createMockUsage(640, 1329),
+    });
+    const attempt = makeEmbeddedRunnerAttempt({
+      assistantTexts: [],
+      lastAssistant: assistant,
+      currentAttemptAssistant: assistant,
+      currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+    });
+    fixture.input.attempt = attempt;
+    fixture.input.attemptAssistant = assistant;
+    fixture.input.currentAttemptAssistant = assistant;
+    fixture.input.terminalState = resolveEmbeddedRunAttemptTerminalState({ attempt, assistant });
+    fixture.input.emptyErrorRetries = 3;
+    fixture.input.fallbackConfigured = true;
+
+    await expect(handleEmbeddedAssistantFailure(fixture.input)).rejects.toMatchObject({
+      reason: "unknown",
+      provider: "anthropic",
+      model: "mock-1",
+      rawError: "Provider completed tool call with malformed JSON arguments",
+    });
+    expect(fixture.advanceAuthProfile).not.toHaveBeenCalled();
+    expect(fixture.traceAttempts).toEqual([
+      {
+        provider: "anthropic",
+        model: "mock-1",
+        result: "fallback_model",
+        reason: "unknown",
+        stage: "assistant",
+      },
+    ]);
+  });
+
   it("does not cache an exact credential-file failure from a fallback candidate", async () => {
     const previous = process.env.OPENCLAW_FALLBACK_SKIP_TTL_MS;
     process.env.OPENCLAW_FALLBACK_SKIP_TTL_MS = "60000";
     try {
-      const config = {
-        agents: {
-          defaults: {
-            model: {
-              primary: "openai/mock-0",
-              fallbacks: ["anthropic/mock-1", "groq/mock-2"],
-            },
-          },
-        },
-      } satisfies OpenClawConfig;
+      const config = createModelFallbackConfig("openai/mock-0", [
+        "anthropic/mock-1",
+        "groq/mock-2",
+      ]) satisfies OpenClawConfig;
       const calls: string[] = [];
       const run = async (provider: string, model: string) => {
         calls.push(`${provider}/${model}`);

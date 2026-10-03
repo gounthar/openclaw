@@ -322,15 +322,20 @@ different visible skill set per agent.
 ```json5
 {
   agents: {
+    ownership: "explicit",
     defaults: {
       skills: ["github", "weather"], // shared baseline
+      heartbeat: { agentId: "writer" },
+      systemAgent: { agentId: "writer" },
+      authInheritance: { agentId: "writer" },
     },
     entries: {
-      writer: { default: true }, // inherits github, weather
+      writer: { workspace: "~/.openclaw/workspace" }, // inherits github, weather
       docs: { skills: ["docs-search"] }, // replaces defaults entirely
       "locked-down": { skills: [] }, // no skills
     },
   },
+  talk: { agentId: "writer" },
 }
 ```
 
@@ -363,10 +368,11 @@ different visible skill set per agent.
 <ParamField path="skills.workshop.autonomous.mode" type='"off" | "propose" | "auto"' default='"auto"'>
   `off` disables autonomous capture while keeping the durable-instruction
   suggestion nudge. `propose` creates pending proposals from corrections and
-  substantial completed work. `auto` sends the same captures through the normal
-  scanner-gated Workshop apply path and runs weekly collection cleanup that can
-  rewrite or drop eligible writable skills. User-prompted skill creation,
-  `/learn`, and manual history scan continue to work in every mode.
+  substantial completed work. `auto` uses normal agent tools for direct per-turn
+  and weekly Workshop maintenance, without proposal scanning or automatic rollback
+  snapshots. Immediate foreground repairs still use scanner-gated proposal apply.
+  User-prompted skill creation,
+  `/learn`, and manual learning sessions continue to work in every mode.
 </ParamField>
 
 See [Self-learning](/tools/self-learning) for eligibility, privacy, cost,

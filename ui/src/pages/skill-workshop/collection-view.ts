@@ -5,11 +5,17 @@ import { stripFrontmatterBlock } from "../../../../packages/markdown-core/src/fr
 import { icons } from "../../components/icons.ts";
 import { toSanitizedMarkdownHtml } from "../../components/markdown.ts";
 import { t } from "../../i18n/index.ts";
+import { registerPluginManagementEnglish } from "../../i18n/locales/en-plugin-management.ts";
+import { registerSkillWorkshopEnglish } from "../../i18n/locales/en-skill-workshop.ts";
 import { formatDateTimeMs, formatRelativeTimestamp } from "../../lib/format.ts";
 import { changedSkillWorkshopVersion } from "../../lib/skill-workshop/index.ts";
 import { renderDiffBlock, renderDiffStatChips } from "../chat/components/chat-diff-render.ts";
 import "../../styles/chat/tool-cards.css";
 import type { SkillWorkshopProps } from "./view-types.ts";
+
+registerSkillWorkshopEnglish();
+
+registerPluginManagementEnglish();
 
 // Skills and drafts are untrusted preview material. Show complete instructions,
 // but keep remote images as links to avoid fetching them during review.
@@ -52,10 +58,12 @@ export function renderSkillWorkshopCollection(props: SkillWorkshopProps) {
             .value=${props.query}
             @input=${(event: Event) =>
               // SAFETY: handler is bound on the <input> itself, so currentTarget is that element.
-              props.onQueryChange((event.currentTarget as HTMLInputElement).value ?? "")}
+              props.onQueryChange((event.currentTarget as HTMLInputElement).value)}
           />
         </label>
-        <p class="sw-collection__count">${collectionCountLabel(props, matches.length)}</p>
+        <p class="sw-collection__count" role="status">
+          ${collectionCountLabel(props, matches.length)}
+        </p>
         <button
           type="button"
           class="btn btn--sm"
@@ -131,7 +139,8 @@ function renderShelf(props: SkillWorkshopProps, matches: InstalledSkill[]) {
       },
     });
   }
-  const selectedName = selectedInstalledName(props);
+  const selectedName =
+    props.installedSelection.status === "idle" ? null : props.installedSelection.name;
   return matches.map((skill) => {
     const isSelected = skill.name === selectedName;
     const changed = changedSkillWorkshopVersion(skill.read);
@@ -165,10 +174,6 @@ function renderShelf(props: SkillWorkshopProps, matches: InstalledSkill[]) {
   });
 }
 
-function selectedInstalledName(props: SkillWorkshopProps): string | null {
-  return props.installedSelection.status === "idle" ? null : props.installedSelection.name;
-}
-
 function renderReader(props: SkillWorkshopProps) {
   const selection = props.installedSelection;
   if (selection.status === "idle") {
@@ -181,9 +186,16 @@ function renderReader(props: SkillWorkshopProps) {
     });
   }
   if (selection.status === "loading") {
-    return html`<p class="sw-collection__state sw-muted" aria-busy="true">
-      ${t("skillWorkshop.collection.loadingSkill", { name: selection.name })}
-    </p>`;
+    return html`<div class="sw-collection__reader-body">
+      ${selection.content === undefined ? nothing : renderSkillDocument(selection.content)}
+      <p class="sw-collection__state sw-muted" role="status">
+        ${
+          selection.content === undefined
+            ? t("skillWorkshop.collection.loadingSkill", { name: selection.name })
+            : t("skillWorkshop.collection.comparing")
+        }
+      </p>
+    </div>`;
   }
   if (selection.status === "error") {
     return html`
@@ -201,19 +213,7 @@ function renderReader(props: SkillWorkshopProps) {
 
   const skill = props.installedSkills.find((entry) => entry.name === selection.name);
   const changed = changedSkillWorkshopVersion(selection);
-  const incompleteVersions = new Set(
-    selection.savedVersions.filter(
-      ({ diff }) =>
-        diff.kind === "truncated" ||
-        diff.stat.added + diff.stat.removed >
-          diff.lines.filter((line) => line.kind === "add" || line.kind === "del").length,
-    ),
-  );
-  const unchanged =
-    !selection.savedVersionsError &&
-    selection.savedVersions.length > 0 &&
-    selection.savedVersions.every((version) => version.diff.kind === "complete") &&
-    !changed;
+  const unchanged = !selection.savedVersionsError && selection.savedVersions.length > 0 && !changed;
   return html`
     <div class="sw-collection__reader-head">
       <div class="sw-collection__reader-identity">
@@ -262,36 +262,22 @@ function renderReader(props: SkillWorkshopProps) {
                                   })
                                 : t("skillWorkshop.collection.savedVersion")
                           }
-                          ${diff.kind === "complete" && (diff.stat.added > 0 || diff.stat.removed > 0) ? renderDiffStatChips(diff.stat) : nothing}
+                          ${diff.stat.added > 0 || diff.stat.removed > 0 ? renderDiffStatChips(diff.stat) : nothing}
                         </summary>
                         ${
-                          diff.kind === "complete" &&
-                          diff.stat.added === 0 &&
-                          diff.stat.removed === 0
+                          diff.stat.added === 0 && diff.stat.removed === 0
                             ? html`<p class="sw-muted">
                                 ${t("skillWorkshop.collection.unchanged")}
                               </p>`
-                            : html`
-                                ${
-                                  incompleteVersions.has(version)
-                                    ? html`<p class="sw-muted">
-                                        ${t("skillWorkshop.collection.diffTruncated")}
-                                      </p>`
-                                    : nothing
-                                }
-                                ${renderDiffBlock(diff.lines, "succeeded", undefined, { path: "SKILL.md" })}
-                              `
+                            : renderDiffBlock(diff.lines, "succeeded", undefined, {
+                                path: "SKILL.md",
+                              })
                         }
                       </details>`;
                     })}
                   `
             }
           </div>
-          ${
-            changed && incompleteVersions.size > 0
-              ? renderSkillDocument(selection.content)
-              : nothing
-          }
         `,
       )}
     </div>

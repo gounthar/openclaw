@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
+import { createAsyncLock } from "openclaw/plugin-sdk/async-lock-runtime";
 import {
   readProviderJsonResponse,
   readProviderTextResponse,
@@ -28,13 +29,12 @@ import {
   resolveLlamaCppModelCacheDir,
   resolveLlamaCppModelSource,
 } from "./defaults.js";
+import { resolveManagedLlamaServerPaths, type LlamaServerAsset } from "./llama-server-assets.js";
 import {
   downloadVerifiedFile,
   ensureLlamaServerInstalled,
-  resolveManagedLlamaServerPaths,
   sha256File,
   type LlamaDownloadProgress,
-  type LlamaServerAsset,
 } from "./llama-server-install.js";
 import {
   buildLlamaServerPreset,
@@ -78,9 +78,9 @@ const resolvedModelArtifacts = new Map<string, ModelArtifact>(); // Presets rema
 const presetState = {
   appliedRevisions: new Map<string, string>(),
   desiredRevisions: new Map<string, string>(),
-  transition: Promise.resolve(),
 };
-const LLAMA_CPP_PRESET_RELOAD_TIMEOUT_MS = 15_000; // b10534 unload window: 10 seconds.
+const runPresetTransition = createAsyncLock();
+const LLAMA_CPP_PRESET_RELOAD_TIMEOUT_MS = 15_000; // Allows five seconds beyond model shutdown.
 
 function parseHuggingFaceSource(source: string): {
   user: string;
@@ -326,12 +326,6 @@ async function writePreset(presetPath: string, contents: string): Promise<void> 
   }
 }
 
-async function runPresetTransition(run: () => Promise<void>): Promise<void> {
-  const pending = presetState.transition.catch(() => undefined).then(run);
-  presetState.transition = pending;
-  await pending;
-}
-
 async function updatePreset(
   presetPath: string,
   params: LlamaServerPresetOptions & { reconcileOrigin?: string },
@@ -348,7 +342,7 @@ async function updatePreset(
       await writePreset(presetPath, next);
     }
     if (params.reconcileOrigin) {
-      // A revision becomes applied only after b10534 acknowledges reload; failures stay dirty.
+      // A revision becomes applied only after llama.cpp acknowledges reload; failures stay dirty.
       presetState.desiredRevisions.set(params.reconcileOrigin, `${presetPath}\0${next}`);
     }
   });

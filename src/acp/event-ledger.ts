@@ -16,7 +16,6 @@ import {
 } from "../state/openclaw-state-db.js";
 import { estimateAcpEventRowBytes, estimateAcpSessionRowBytes } from "./event-ledger-bytes.js";
 import {
-  cloneAcpLedgerValue,
   createAcpPromptUpdates,
   normalizeAcpLedgerEvent,
   normalizeAcpLedgerOptions,
@@ -27,7 +26,6 @@ import {
   type AcpMutableLedgerState,
 } from "./event-ledger.types.js";
 
-export { createInMemoryAcpEventLedger } from "./event-ledger.memory.js";
 export type { AcpEventLedger, AcpEventLedgerReplay } from "./event-ledger.types.js";
 
 function normalizeSqliteInteger(value: number | bigint | null): number {
@@ -127,26 +125,34 @@ function createSqliteLedgerQueries(db: DatabaseSync) {
           parameter((params) => params.sessionId),
         ),
     ),
-    readOverCapSessions: prepareSqliteQuerySync<
+    readEventCapCandidates: prepareSqliteQuerySync<
       number,
       { session_id: string; event_count: number }
     >(db, (parameter) =>
       query
-        .selectFrom(
-          query
-            .selectFrom("acp_replay_sessions as s")
-            .leftJoin("acp_replay_events as e", "e.session_id", "s.session_id")
-            .select("s.session_id")
-            .select((eb) => eb.fn.count<number>("e.seq").as("event_count"))
-            .groupBy("s.session_id")
-            .as("counts"),
+        .selectFrom("acp_replay_sessions as s")
+        .select("s.session_id")
+        .select((eb) =>
+          eb
+            .selectFrom("acp_replay_events as e")
+            .select((count) => count.fn.count<number>("e.seq").as("event_count"))
+            .whereRef("e.session_id", "=", "s.session_id")
+            .as("event_count"),
         )
-        .select(["session_id", "event_count"])
-        .where(
-          "event_count",
-          ">",
-          parameter((limit) => limit),
-        ),
+        .where((eb) => {
+          const events = eb
+            .selectFrom("acp_replay_events as e")
+            .whereRef("e.session_id", "=", "s.session_id");
+          return eb(
+            eb(
+              events.select((endpoint) => endpoint.fn.max<number>("e.seq").as("seq")),
+              "-",
+              events.select((endpoint) => endpoint.fn.min<number>("e.seq").as("seq")),
+            ),
+            ">=",
+            parameter((limit) => limit),
+          );
+        }),
     ),
     readExcessSessions: prepareSqliteQuerySync<number, { session_id: string }>(db, (parameter) =>
       query
@@ -378,11 +384,11 @@ function trimSqliteLedger(
   db: DatabaseSync,
   state: Pick<AcpMutableLedgerState, "maxEventsPerSession" | "maxSessions" | "maxSerializedBytes">,
 ): void {
-  // Cheap precheck: only sessions actually above the per-session cap pay for
-  // event deletion (Codex log-partition pattern).
+  // Indexed sequence endpoints bound the count even when retained sequences have
+  // gaps. Only histories that could exceed the cap need an exact count.
   const queries = getSqliteLedgerQueries(db);
-  const overCapSessions = queries.readOverCapSessions(state.maxEventsPerSession).rows;
-  for (const row of overCapSessions) {
+  const eventCapCandidates = queries.readEventCapCandidates(state.maxEventsPerSession).rows;
+  for (const row of eventCapCandidates) {
     const overage = normalizeSqliteInteger(row.event_count) - state.maxEventsPerSession;
     if (overage > 0) {
       deleteOldestSqliteEvents(db, row.session_id, overage);
@@ -431,7 +437,7 @@ function appendSqliteUpdate(
     complete: false,
   });
   const now = state.now();
-  const updateJson = JSON.stringify(cloneAcpLedgerValue(params.update));
+  const updateJson = JSON.stringify(structuredClone(params.update));
   const eventBytes = estimateAcpEventRowBytes({
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { root as fsRoot } from "../infra/fs-safe.js";
-import { GITHUB_PUBLICATION_CONFIG_GUARD_JS } from "./github-publication-base.js";
+import { GITHUB_PUBLICATION_CONFIG_GUARD } from "./github-publication-base.js";
 import {
   MAX_RECONCILIATION_ENTRIES,
   MAX_RECONCILIATION_FILE_BYTES,
@@ -35,12 +35,13 @@ const maxFile = ${MAX_RECONCILIATION_FILE_BYTES};
 const maxTotal = ${MAX_RECONCILIATION_TOTAL_BYTES};
 const maxEntries = ${MAX_RECONCILIATION_ENTRIES};
 const objectPattern = /^[a-f0-9]{40}$/;
+const gitNullPath = process.platform === "win32" ? "NUL" : "/dev/null";
 const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_ATTR_NOSYSTEM: "1",
-  GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_SYSTEM: os.devNull,
+  GIT_CONFIG_GLOBAL: gitNullPath, GIT_CONFIG_SYSTEM: gitNullPath,
   GIT_CONFIG_COUNT: "0" };
 function git(args, options = {}) {
-  const result = spawnSync("git", ["-c", "core.hooksPath=" + os.devNull, "-c",
-    "core.fsmonitor=false", "-c", "core.attributesFile=" + os.devNull, ...args], {
+  const result = spawnSync("git", ["-c", "core.hooksPath=" + gitNullPath, "-c",
+    "core.fsmonitor=false", "-c", "core.attributesFile=" + gitNullPath, ...args], {
     cwd, env, timeout: 60000, maxBuffer: maxFile + 1, ...options,
   });
   if (result.error || result.status !== 0) throw Error("Publication snapshot Git command failed");
@@ -61,7 +62,7 @@ const relativeOutput = path.relative(path.resolve(cwd), path.resolve(output));
 if (!relativeOutput.startsWith(".." + path.sep) && !path.isAbsolute(relativeOutput)) {
   throw Error("Publication snapshot output must be outside the workspace");
 }
-${GITHUB_PUBLICATION_CONFIG_GUARD_JS}
+${GITHUB_PUBLICATION_CONFIG_GUARD.script}
 if (text(["for-each-ref", "--count=1", "--format=%(refname)", "refs/replace"])) {
   throw Error("Publication snapshot has unsupported Git replacement metadata");
 }
@@ -76,13 +77,16 @@ const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-publication-in
 try {
   const index = path.resolve(cwd, text(["rev-parse", "--git-path", "index"]));
   env.GIT_INDEX_FILE = path.join(temporary, "index");
-  // Keep explicitly staged ignored paths and cached removals; normalize only the copy.
+  // Keep explicitly staged ignored paths and cached removals; stage changes only in the copy.
+  const indexStat = fs.statSync(index, { bigint: true });
   fs.copyFileSync(index, env.GIT_INDEX_FILE);
+  // A newer copy timestamp hides racy-clean edits. Round down so lost precision only adds reads.
+  const indexTimestamp = Number(indexStat.mtimeNs / 1_000_000_000n);
+  fs.utimesSync(env.GIT_INDEX_FILE, indexTimestamp, indexTimestamp);
   // Unresolved merge stages cannot define an accepted tree.
   git(["write-tree"]);
+  // Ordinary staging preserves unchanged blobs; renormalization would rewrite unrelated CRLF files.
   git(["add", "-A"]);
-  // Normalize after removals, retaining intent-to-add paths and ignoring copied stat caches.
-  git(["add", "--renormalize", "-u"]);
   const workspaceTree = text(["write-tree"]);
   const baseTree = text(["rev-parse", baseCommit + "^{tree}"]);
   const attributes = git(["ls-tree", "-r", "-z", "--full-tree", workspaceTree]);
@@ -128,7 +132,7 @@ try {
 } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 `;
 
-function parseGitHubRepositoryPublicationSnapshot(
+export function parseGitHubRepositoryPublicationSnapshot(
   raw: string,
   digest: string,
 ): GitHubRepositoryPublicationSnapshot {
@@ -190,6 +194,14 @@ function parseGitHubRepositoryPublicationSnapshot(
   };
 }
 
+async function readPublicationFile(root: string, file: string) {
+  return (await fsRoot(root)).read(file, {
+    maxBytes: MAX_RECONCILIATION_FILE_BYTES,
+    symlinks: "reject",
+    hardlinks: "reject",
+  });
+}
+
 export async function readGitHubRepositoryPublicationBlob(
   root: string,
   sha: string,
@@ -197,13 +209,7 @@ export async function readGitHubRepositoryPublicationBlob(
   if (!gitObjectPattern.test(sha)) {
     throw new Error("GitHub publication blob identity is invalid.");
   }
-  const { buffer: bytes } = await (
-    await fsRoot(root)
-  ).read("blobs/" + sha, {
-    maxBytes: MAX_RECONCILIATION_FILE_BYTES,
-    symlinks: "reject",
-    hardlinks: "reject",
-  });
+  const { buffer: bytes } = await readPublicationFile(root, "blobs/" + sha);
   const actual = createHash("sha1")
     .update("blob " + bytes.length + "\0")
     .update(bytes)
@@ -215,13 +221,7 @@ export async function readGitHubRepositoryPublicationBlob(
 }
 
 export async function readGitHubRepositoryPublicationMetadata(root: string, digest: string) {
-  const { buffer } = await (
-    await fsRoot(root)
-  ).read("snapshot.json", {
-    maxBytes: MAX_RECONCILIATION_FILE_BYTES,
-    symlinks: "reject",
-    hardlinks: "reject",
-  });
+  const { buffer } = await readPublicationFile(root, "snapshot.json");
   const raw = buffer.toString("utf8");
   return { raw, snapshot: parseGitHubRepositoryPublicationSnapshot(raw, digest) };
 }

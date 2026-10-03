@@ -93,7 +93,7 @@ describe("show_widget prompt", () => {
   });
   it("keeps proactive single visualizations inline unless dashboard use meets its threshold", () => {
     const tool = createShowWidgetTool();
-    const directoryDescription = tool.description.slice(0, 177);
+    const directoryDescription = tool.description.slice(0, 184);
     const properties = (
       tool.parameters as {
         properties?: {
@@ -111,12 +111,14 @@ describe("show_widget prompt", () => {
     );
     expect(directoryDescription).toContain("explicit dashboard request");
     expect(directoryDescription).toContain("multiple non-code visualizations");
-    expect(directoryDescription).toContain("Update HTML by name");
+    expect(directoryDescription).toContain("Update pinned HTML by name");
     expect(pinDescription).toContain("explicit dashboard request");
     expect(pinDescription).toContain("multiple non-code visualizations");
     expect(properties?.name?.description).toMatch(/same name.*pin=true.*widget_code/i);
     expect(properties?.widget_code?.description).toContain("fluid widths");
     expect(properties?.widget_code?.description).toMatch(/wrap or stack.*narrow/i);
+    expect(tool.description).toContain('Default videos to controls playsinline preload="auto"');
+    expect(tool.description).toContain("do not autoplay");
   });
 
   it("offers native reports for a session dashboard with a bounded data contract", () => {

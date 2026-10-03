@@ -1,4 +1,3 @@
-// Diagnostics Otel plugin module implements service behavior.
 import { createNoopMeter, diag, metrics, trace, type SpanContext } from "@opentelemetry/api";
 import * as otelCore from "@opentelemetry/core";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
@@ -13,8 +12,14 @@ import {
   TraceIdRatioBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
+import type { DiagnosticTraceContext } from "openclaw/plugin-sdk/diagnostic-runtime";
+import { asFiniteNumberInRange } from "openclaw/plugin-sdk/number-runtime";
+import type { OpenClawPluginService } from "openclaw/plugin-sdk/plugin-entry";
 import { registerUnhandledRejectionHandler } from "openclaw/plugin-sdk/runtime-env";
-import type { DiagnosticTraceContext, OpenClawPluginService } from "../api.js";
+import {
+  normalizeOptionalString,
+  readNonBlankString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   DEFAULT_SERVICE_NAME,
   OTEL_EXPORTER_OTLP_ENDPOINT_ENV,
@@ -26,10 +31,7 @@ import {
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT_ENV,
   OTEL_EXPORTER_OTLP_TRACES_PROTOCOL_ENV,
 } from "./service-constants.js";
-import {
-  hasPreloadedOtelSdk,
-  resolveContentCapturePolicy,
-} from "./service-content-normalization.js";
+import { hasPreloadedOtelSdk } from "./service-content-normalization.js";
 import { createDiagnosticsEventHandler } from "./service-events.js";
 import {
   createExporterHealthEventEmitter,
@@ -41,16 +43,13 @@ import {
   errorCategory,
   findOtlpExporterError,
   formatError,
-  normalizeEndpoint,
   readErrorCode,
   resolveOtelHttpAgentOptions,
-  resolveSampleRate,
   resolveSignalOtelUrl,
 } from "./service-exporter.js";
 import { createDiagnosticsLogExporter } from "./service-logs.js";
 import { createDiagnosticsMetrics } from "./service-metrics.js";
 import { registerOwnedSdkRuntime } from "./service-propagation.js";
-import { createDiagnosticsRecorderRuntime } from "./service-recorder-runtime.js";
 import { createHarnessRecorders } from "./service-recorders-harness.js";
 import { createModelRecorders } from "./service-recorders-model.js";
 import { createOperationsRecorders } from "./service-recorders-operations.js";
@@ -94,11 +93,6 @@ function isOtelSdkDisabled(logger: { warn(message: string): void }): boolean {
   return false;
 }
 
-function readNonblankOtelEnv(name: string): string | undefined {
-  const value = process.env[name];
-  return value?.trim() ? value : undefined;
-}
-
 function readPositiveOtelNumber(name: string, fallback: number): number {
   const value = otelCore.getNumberFromEnv(name);
   if (value !== undefined && value <= 0) {
@@ -136,8 +130,8 @@ function resolveSignalProtocol(
 ): string {
   return (
     configuredProtocol ??
-    readNonblankOtelEnv(OTEL_SIGNAL_PROTOCOL_ENV[signal]) ??
-    readNonblankOtelEnv(OTEL_EXPORTER_OTLP_PROTOCOL_ENV) ??
+    readNonBlankString(process.env[OTEL_SIGNAL_PROTOCOL_ENV[signal]]) ??
+    readNonBlankString(process.env[OTEL_EXPORTER_OTLP_PROTOCOL_ENV]) ??
     OTLP_HTTP_PROTOBUF_PROTOCOL
   );
 }
@@ -377,13 +371,13 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
         ? process.env[OTEL_EXPORTER_OTLP_ENDPOINT_ENV]
         : undefined;
       const endpoint = hasOwnedOtlpSignal
-        ? normalizeEndpoint(otel.endpoint ?? sharedEnvEndpoint)
+        ? normalizeOptionalString(otel.endpoint ?? sharedEnvEndpoint)
         : undefined;
       const headers = otel.headers ?? undefined;
       const serviceName =
         otel.serviceName?.trim() || process.env.OTEL_SERVICE_NAME || DEFAULT_SERVICE_NAME;
-      const sampleRate = resolveSampleRate(otel.sampleRate);
-      const contentCapturePolicy = resolveContentCapturePolicy(otel.captureContent);
+      const sampleRate = asFiniteNumberInRange(otel.sampleRate, { min: 0, max: 1 });
+      const captureContent = otel.captureContent === true;
 
       const resource = resources.resourceFromAttributes({
         [ATTR_SERVICE_NAME]: serviceName,
@@ -561,7 +555,7 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       const diagnosticMetrics = createDiagnosticsMetrics(meter, otel.metricNamePrefix);
 
       const diagnosticsLogs = createDiagnosticsLogExporter({
-        contentCapturePolicy,
+        captureContent,
         emitExporterEvent,
         flushIntervalMs: otel.flushIntervalMs,
         headers,
@@ -577,12 +571,12 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
       active.logProvider = diagnosticsLogs.logProvider;
       const { recordLogRecord, recordSecurityEvent } = diagnosticsLogs;
 
-      const recorderRuntime = createDiagnosticsRecorderRuntime({
-        contentCapturePolicy,
-        metrics: diagnosticMetrics,
-        traces: diagnosticsTrace,
+      const recorderRuntime = {
+        ...diagnosticMetrics,
+        ...diagnosticsTrace,
+        captureContent,
         tracesEnabled: tracesActive,
-      });
+      };
       const recorders = {
         ...createUsageRecorders(recorderRuntime),
         ...createOperationsRecorders(recorderRuntime),
@@ -599,7 +593,9 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
           recordSecurityEvent,
         }),
         metricsActive
-          ? undefined
+          ? tracesActive
+            ? undefined
+            : { exclude: ["diagnostic.phase.completed"] }
           : tracesActive
             ? { exclude: ["gateway.event_loop.sample", "diagnostic.gc"] }
             : { include: ["log.record", "security.event"] },

@@ -3,6 +3,7 @@ package ai.openclaw.app.ui
 import ai.openclaw.app.GatewayModelProviderSummary
 import ai.openclaw.app.GatewayModelSummary
 import ai.openclaw.app.MainViewModel
+import ai.openclaw.app.chat.ChatSessionEntry
 import ai.openclaw.app.currentAppLanguage
 import ai.openclaw.app.i18n.NativeText
 import ai.openclaw.app.i18n.nativeString
@@ -10,7 +11,10 @@ import ai.openclaw.app.i18n.nativeText
 import ai.openclaw.app.i18n.resolveNativeText
 import ai.openclaw.app.i18n.resolveNativeTextResource
 import ai.openclaw.app.i18n.verbatimText
+import ai.openclaw.app.ui.design.ClawAvatarMark
 import ai.openclaw.app.ui.design.ClawEmptyState
+import ai.openclaw.app.ui.design.ClawIcons
+import ai.openclaw.app.ui.design.ClawListItem
 import ai.openclaw.app.ui.design.ClawPanel
 import ai.openclaw.app.ui.design.ClawPlainIconButton
 import ai.openclaw.app.ui.design.ClawScaffold
@@ -36,8 +40,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.AccessTime
-import androidx.compose.material.icons.outlined.ChatBubbleOutline
-import androidx.compose.material.icons.outlined.MicNone
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -54,14 +56,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
-/** Full-screen command palette for navigation and recent-session search. */
 @Composable
 internal fun CommandPalette(
   viewModel: MainViewModel,
@@ -73,7 +73,6 @@ internal fun CommandPalette(
   val sessions by viewModel.chatSessions.collectAsState()
   val models by viewModel.providerModelCatalog.collectAsState()
   val providers by viewModel.modelAuthProviders.collectAsState()
-  val pendingRunCount by viewModel.pendingRunCount.collectAsState()
   val desktopObserveAvailable by viewModel.desktopObserveAvailable.collectAsState()
   var query by rememberSaveable { mutableStateOf("") }
   val searchFocusRequester = remember { FocusRequester() }
@@ -99,7 +98,7 @@ internal fun CommandPalette(
   Surface(modifier = Modifier.fillMaxSize(), color = ClawTheme.colors.canvas, contentColor = ClawTheme.colors.text) {
     ClawScaffold(contentPadding = PaddingValues(start = 20.dp, top = 14.dp, end = 20.dp, bottom = 20.dp)) {
       LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        item {
+        item(key = "header") {
           Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -115,12 +114,12 @@ internal fun CommandPalette(
               modifier = Modifier.size(ClawTheme.spacing.touchTarget),
               contentAlignment = Alignment.Center,
             ) {
-              CommandAvatar(text = "OC")
+              ClawAvatarMark(text = "OC")
             }
           }
         }
 
-        item {
+        item(key = "query") {
           ClawTextField(
             value = query,
             onValueChange = { query = it },
@@ -129,26 +128,25 @@ internal fun CommandPalette(
           )
         }
 
-        item {
-          CommandSectionLabel(title = nativeString("Quick actions"))
+        if (actionRows.isNotEmpty() || sessionRows.isEmpty()) {
+          item(key = "actions-heading") {
+            CommandSectionLabel(title = nativeString("Quick actions"))
+          }
+          item(key = "actions") {
+            if (actionRows.isEmpty()) {
+              ClawEmptyState(title = nativeString("No actions found"), body = nativeString("Try Chat, Voice, Threads, Providers, or Settings."))
+            } else {
+              CommandList(rows = actionRows) { row -> CommandActionRow(row = row, onOpen = onOpen) }
+            }
+          }
         }
 
-        if (actionRows.isEmpty()) {
-          item {
-            ClawEmptyState(title = nativeString("No actions found"), body = nativeString("Try Chat, Voice, Threads, Providers, or Settings."))
-          }
-        } else {
-          item {
-            CommandActionList(rows = actionRows, onOpen = onOpen)
-          }
-        }
-
-        item {
+        item(key = "threads-heading") {
           CommandSectionLabel(title = nativeString("Threads"))
         }
 
-        if (sessionRows.isEmpty()) {
-          item {
+        item(key = "threads") {
+          if (sessionRows.isEmpty()) {
             ClawPanel {
               Text(
                 text = if (isConnected) nativeString("No matching threads yet.") else nativeString("Connect the Gateway to search threads."),
@@ -156,22 +154,10 @@ internal fun CommandPalette(
                 color = ClawTheme.colors.textMuted,
               )
             }
-          }
-        } else {
-          item {
-            CommandSessionList(
-              rows =
-                sessionRows.map { session ->
-                  CommandSessionRow(
-                    key = session.key,
-                    ownerAgentId = session.ownerAgentId,
-                    title = sessionPresentationTitle(session) { nativeString("Main thread") },
-                    subtitle = if (pendingRunCount > 0) nativeString("Assistant working") else nativeString("OpenClaw thread"),
-                    metadata = session.updatedAtMs?.let(::relativeSessionTime) ?: nativeString("now"),
-                  )
-                },
-              onOpen = onOpenSession,
-            )
+          } else {
+            CommandList(rows = sessionRows) { row ->
+              CommandSessionListRow(row = row, onClick = { onOpenSession(row.key, row.ownerAgentId) })
+            }
           }
         }
       }
@@ -208,11 +194,11 @@ internal fun commandItems(
     .map { action ->
       when (action) {
         CommandAction.Chat -> {
-          CommandItem(action, nativeText("Open Chat"), nativeText("Start or continue a conversation"), Icons.Outlined.ChatBubbleOutline)
+          CommandItem(action, nativeText("Open Chat"), nativeText("Start or continue a conversation"), ClawIcons.Chat)
         }
 
         CommandAction.Voice -> {
-          CommandItem(action, nativeText("Start Voice"), nativeText("Talk or dictate with OpenClaw"), Icons.Outlined.MicNone)
+          CommandItem(action, nativeText("Start Voice"), nativeText("Talk or dictate with OpenClaw"), ClawIcons.Mic)
         }
 
         CommandAction.Sessions -> {
@@ -225,6 +211,7 @@ internal fun commandItems(
             when (route) {
               SettingsRoute.Home -> nativeText("Gateway, voice, notifications, privacy")
               SettingsRoute.ProvidersModels -> verbatimText(providerSubtitle)
+              SettingsRoute.SystemAgent -> nativeText("Setup, status, and repair")
               else -> checkNotNull(route.category).title
             }
           CommandItem(action, route.title, subtitle, route.icon)
@@ -269,23 +256,13 @@ internal fun commandActionAccessibilityDescription(
     is CommandAction.Settings -> resolve("Open \${row.title}", title)
   }
 
-private data class CommandSessionRow(
-  val key: String,
-  val ownerAgentId: String?,
-  val title: String,
-  val subtitle: String,
-  val metadata: String,
-)
-
 @Composable
-private fun CommandActionList(
-  rows: List<CommandItem>,
-  onOpen: (CommandAction) -> Unit,
+private fun <T> CommandList(
+  rows: List<T>,
+  content: @Composable (T) -> Unit,
 ) {
   ClawPanel(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
-    ClawSeparatedColumn(items = rows) { row ->
-      CommandActionRow(row = row, onOpen = onOpen)
-    }
+    ClawSeparatedColumn(items = rows, row = content)
   }
 }
 
@@ -296,43 +273,23 @@ private fun CommandActionRow(
 ) {
   val title = row.title.resolveNativeTextResource()
   val subtitle = row.subtitle.resolveNativeTextResource()
-  Surface(color = Color.Transparent, contentColor = ClawTheme.colors.text) {
-    Row(
-      modifier =
-        Modifier
-          .fillMaxWidth()
-          .heightIn(min = 52.dp)
-          .clip(RoundedCornerShape(ClawTheme.radii.row))
-          .clickable(onClickLabel = commandActionAccessibilityDescription(row.action, title), onClick = { onOpen(row.action) })
-          .padding(horizontal = 2.dp, vertical = 6.dp),
-      verticalAlignment = Alignment.CenterVertically,
-      horizontalArrangement = Arrangement.spacedBy(9.dp),
-    ) {
-      CommandRowIcon(icon = row.icon)
-      Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-        Text(text = title, style = ClawTheme.type.body, color = ClawTheme.colors.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text(text = subtitle, style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-      }
-      CommandRowChevron(contentDescription = null)
-    }
-  }
-}
-
-@Composable
-private fun CommandSessionList(
-  rows: List<CommandSessionRow>,
-  onOpen: (String, String?) -> Unit,
-) {
-  ClawPanel(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
-    ClawSeparatedColumn(items = rows) { row ->
-      CommandSessionListRow(row = row, onClick = { onOpen(row.key, row.ownerAgentId) })
-    }
-  }
+  ClawListItem(
+    title = title,
+    subtitle = subtitle,
+    modifier =
+      Modifier
+        .heightIn(min = 52.dp)
+        .clip(RoundedCornerShape(ClawTheme.radii.row))
+        .clickable(onClickLabel = commandActionAccessibilityDescription(row.action, title), onClick = { onOpen(row.action) })
+        .padding(horizontal = 2.dp),
+    leading = { CommandRowIcon(icon = row.icon) },
+    trailing = { CommandRowChevron(contentDescription = null) },
+  )
 }
 
 @Composable
 private fun CommandSessionListRow(
-  row: CommandSessionRow,
+  row: ChatSessionEntry,
   onClick: () -> Unit,
 ) {
   Surface(color = ClawTheme.colors.canvas, contentColor = ClawTheme.colors.text) {
@@ -347,12 +304,12 @@ private fun CommandSessionListRow(
       verticalAlignment = Alignment.CenterVertically,
       horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-      CommandRowIcon(icon = Icons.Outlined.ChatBubbleOutline)
+      CommandRowIcon(icon = ClawIcons.Chat)
       Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-        Text(text = row.title, style = ClawTheme.type.body, color = ClawTheme.colors.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text(text = row.subtitle, style = ClawTheme.type.caption, color = ClawTheme.colors.textSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(text = sessionPresentationTitle(row) { nativeString("Main thread") }, style = ClawTheme.type.body, color = ClawTheme.colors.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(text = sessionListSubtitle(row, fallback = nativeString("OpenClaw thread"), activeRunLabel = nativeString("Assistant working")), style = ClawTheme.type.caption, color = ClawTheme.colors.textSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
       }
-      Text(text = row.metadata, style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+      Text(text = row.updatedAtMs?.let(::relativeSessionTime) ?: nativeString("now"), style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
       CommandRowChevron(contentDescription = nativeString("Open thread"))
     }
   }
@@ -381,21 +338,6 @@ private fun CommandRowChevron(contentDescription: String?) {
       modifier = Modifier.size(17.dp),
       tint = ClawTheme.colors.textMuted,
     )
-  }
-}
-
-@Composable
-private fun CommandAvatar(text: String) {
-  Surface(
-    modifier = Modifier.size(34.dp),
-    shape = CircleShape,
-    color = ClawTheme.colors.surfaceRaised,
-    contentColor = ClawTheme.colors.text,
-    border = BorderStroke(1.dp, ClawTheme.colors.border),
-  ) {
-    Box(contentAlignment = Alignment.Center) {
-      Text(text = localizedUppercase(text.take(2), currentAppLanguage().languageTag), style = ClawTheme.type.label)
-    }
   }
 }
 

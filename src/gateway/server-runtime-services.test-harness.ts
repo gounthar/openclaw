@@ -1,15 +1,15 @@
 import { vi } from "vitest";
+import { createInfoWarnErrorLogger } from "../../test/helpers/mock-logger.js";
 import type { scheduleGatewayPostReadyMaintenance } from "./server-runtime-services.js";
 
 type StartSessionDeliveryRuntime =
   typeof import("../infra/session-delivery-queue-runtime.js").startSessionDeliveryRuntime;
-type StartHeartbeatRunner = typeof import("../infra/heartbeat-runner.js").startHeartbeatRunner;
+type StartHeartbeatRunner =
+  typeof import("../infra/heartbeat-runner-scheduler.js").startHeartbeatRunner;
 type DrainPendingDeliveries =
   typeof import("../infra/outbound/delivery-queue-recovery.js").drainPendingDeliveriesCore;
 type RecoverPendingDeliveries =
   typeof import("../infra/outbound/delivery-queue-recovery.js").recoverPendingDeliveries;
-type MigrateLegacyPendingOutboundDeliveries =
-  typeof import("../infra/outbound/delivery-queue-migration.js").migrateLegacyPendingOutboundDeliveries;
 
 const runtimeServiceMocks = vi.hoisted(() => {
   const heartbeatRunner = {
@@ -40,9 +40,7 @@ const runtimeServiceMocks = vi.hoisted(() => {
       skippedMaxRetries: 0,
       deferredBackoff: 0,
     })),
-    migrateLegacyPendingOutboundDeliveries: vi.fn<MigrateLegacyPendingOutboundDeliveries>(
-      async () => ({ moved: 0, skipped: 0, remaining: 0 }),
-    ),
+    countPendingDeliveryQueueEntries: vi.fn(() => 0),
     drainPendingDeliveries: vi.fn<DrainPendingDeliveries>(async () => undefined),
     recoverPendingRestartContinuationDeliveries: vi.fn(async () => undefined),
     deliverQueuedSessionDelivery: vi.fn(async () => undefined),
@@ -52,11 +50,11 @@ const runtimeServiceMocks = vi.hoisted(() => {
   };
 });
 
-vi.mock("../infra/heartbeat-runner.js", () => ({
-  resolveHeartbeatAgents: (cfg: { agents?: { defaults?: { heartbeat?: unknown } } }) => [
-    { agentId: "main", heartbeat: cfg.agents?.defaults?.heartbeat },
-  ],
+vi.mock("../infra/heartbeat-runner-scheduler.js", () => ({
   startHeartbeatRunner: runtimeServiceMocks.startHeartbeatRunner,
+}));
+
+vi.mock("../infra/heartbeat-runner-run.js", () => ({
   runHeartbeatOnce: runtimeServiceMocks.runHeartbeatOnce,
 }));
 
@@ -74,9 +72,9 @@ vi.mock("../infra/outbound/delivery-queue-recovery.js", () => ({
   drainPendingDeliveriesCore: runtimeServiceMocks.drainPendingDeliveries,
 }));
 
-vi.mock("../infra/outbound/delivery-queue-migration.js", () => ({
-  migrateLegacyPendingOutboundDeliveries:
-    runtimeServiceMocks.migrateLegacyPendingOutboundDeliveries,
+vi.mock("../infra/delivery-queue-sqlite.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/delivery-queue-sqlite.js")>()),
+  countPendingDeliveryQueueEntries: runtimeServiceMocks.countPendingDeliveryQueueEntries,
 }));
 
 vi.mock("./conversation-route-ownership.js", () => ({
@@ -112,20 +110,14 @@ export function waitForFast<T>(
 
 export function createLog() {
   return {
-    child: vi.fn(() => ({
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    })),
+    child: vi.fn(() => createInfoWarnErrorLogger()),
     warn: vi.fn(),
     error: vi.fn(),
   };
 }
 
-export const createTestCron = () => ({ start: vi.fn<() => Promise<void>>(async () => {}) });
-
 export function createTestCronState(
-  cron: { start: () => Promise<void> } = createTestCron(),
+  cron: { start: () => Promise<void> } = { start: vi.fn(async () => {}) },
   cronEnabled = true,
 ) {
   return {
@@ -145,9 +137,11 @@ export function createTestCronReconciliation(complete: () => Promise<void> = asy
 }
 
 export function createPostReadyMaintenanceScheduleParams(
-  overrides: Partial<Parameters<typeof scheduleGatewayPostReadyMaintenance>[0]> = {},
+  overrides: Partial<Parameters<typeof scheduleGatewayPostReadyMaintenance>[0]> &
+    Pick<Parameters<typeof scheduleGatewayPostReadyMaintenance>[0], "scheduler">,
 ): Parameters<typeof scheduleGatewayPostReadyMaintenance>[0] {
   return {
+    signal: new AbortController().signal,
     delayMs: 1,
     isClosing: () => false,
     startMaintenance: vi.fn(async () => null),
@@ -166,13 +160,10 @@ export function createPostReadyMaintenanceScheduleParams(
 
 export function createMaintenanceHandles() {
   return {
-    tickInterval: setInterval(() => undefined, 60_000),
-    healthInterval: setInterval(() => undefined, 60_000),
-    dedupeCleanup: setInterval(() => undefined, 60_000),
+    stopPeriodicTasks: vi.fn(async () => {}),
     startMediaCleanup: vi.fn(async () => undefined),
     stopMediaCleanup: vi.fn(async () => "drained" as const),
-    worktreeCleanup: setInterval(() => undefined, 60_000),
-    skillUsageCleanup: vi.fn(),
+    skillUsageCleanup: vi.fn(async () => {}),
   };
 }
 
@@ -194,12 +185,7 @@ export function resetRuntimeServiceMocks() {
     skippedMaxRetries: 0,
     deferredBackoff: 0,
   });
-  runtimeServiceMocks.migrateLegacyPendingOutboundDeliveries.mockReset();
-  runtimeServiceMocks.migrateLegacyPendingOutboundDeliveries.mockResolvedValue({
-    moved: 0,
-    skipped: 0,
-    remaining: 0,
-  });
+  runtimeServiceMocks.countPendingDeliveryQueueEntries.mockReset().mockReturnValue(0);
   runtimeServiceMocks.drainPendingDeliveries.mockReset();
   runtimeServiceMocks.drainPendingDeliveries.mockResolvedValue(undefined);
   runtimeServiceMocks.recoverPendingRestartContinuationDeliveries.mockClear();

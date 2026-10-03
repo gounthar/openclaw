@@ -14,16 +14,12 @@ import type { PreparedReplyConversation } from "./prompt-session-context.js";
 
 const groupsRuntimeLoader = createLazyImportLoader(() => import("./groups.runtime.js"));
 
-function loadGroupsRuntime() {
-  return groupsRuntimeLoader.load();
-}
-
 async function resolveRuntimeChannelId(raw?: string | null): Promise<string | null> {
   const normalized = normalizeOptionalLowercaseString(raw);
   if (!normalized) {
     return null;
   }
-  const { getChannelPlugin, normalizeChannelId } = await loadGroupsRuntime();
+  const { getChannelPlugin, normalizeChannelId } = await groupsRuntimeLoader.load();
   try {
     if (getChannelPlugin(normalized)) {
       return normalized;
@@ -50,7 +46,7 @@ export async function resolveGroupRequireMention(params: {
   }
   const { groupId, groupChannel, groupSpace, accountId } = group;
   let requireMention: boolean | undefined;
-  const runtime = await loadGroupsRuntime();
+  const runtime = await groupsRuntimeLoader.load();
   try {
     requireMention = runtime.getChannelPlugin(channel)?.groups?.resolveRequireMention?.({
       cfg,
@@ -149,23 +145,12 @@ export function buildGroupChatContext(params: {
     !messageToolOnly && params.silentToken && params.silentReplyPolicy !== "disallow";
   if (messageToolOnly) {
     lines.push(
-      `If no visible ${sharedChatNoun === "channel" ? "channel" : "group"} response is needed, do not call message(action=send). Your normal final answer stays private and will not be posted to ${destinationLabel}.`,
+      `If no visible ${sharedChatNoun === "channel" ? "channel" : "group"} response is needed, do not call message(action=send).`,
     );
-    lines.push("Be extremely selective: reply only when directly addressed or clearly helpful.");
   }
   if (canUseSilentReply) {
     lines.push(
-      `If no response is needed, reply with exactly "${params.silentToken}" (and nothing else) so OpenClaw stays silent.`,
-    );
-    lines.push("Be extremely selective: reply only when directly addressed or clearly helpful.");
-    lines.push(
-      "Do not add any other words, punctuation, tags, markdown/code blocks, or explanations.",
-    );
-    lines.push(
-      `If you only react or otherwise handle the message without a text reply, your final answer must still be exactly "${params.silentToken}". Never say that you are staying quiet, keeping channel noise low, making a context-only note, or sending no channel reply.`,
-    );
-    lines.push(
-      `Any prose describing silence is wrong; the whole final answer must be only "${params.silentToken}".`,
+      `If no text reply is needed, including after a reaction or other action, reply with exactly "${params.silentToken}" as the entire final answer, without commentary, punctuation, or formatting.`,
     );
   }
   return lines.join(" ");

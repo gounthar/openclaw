@@ -1,5 +1,6 @@
 /** Acyclic contracts for capabilities stored in the installed plugin registry. */
 import type { EmbeddingInput } from "../../packages/memory-host-sdk/src/engine-embeddings.js";
+import type { ConversationRecallContext } from "../agents/conversation-recall.types.js";
 import type { MemoryCitationsMode } from "../config/types.memory.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ContextEngine } from "../context-engine/types.js";
@@ -11,6 +12,10 @@ import type {
   MemorySearchResult,
 } from "../memory-host-sdk/host/types.js";
 import type {
+  EmbeddingBatchChunk,
+  EmbeddingBatchOptions,
+} from "./embedding-provider-runtime-types.js";
+import type {
   EmbeddingProvider,
   EmbeddingProviderAdapter,
   EmbeddingProviderCallOptions,
@@ -19,6 +24,10 @@ import type {
   EmbeddingProviderIndexIdentity,
   EmbeddingProviderRuntime,
 } from "./embedding-provider-types.js";
+import type {
+  MemoryProviderOpenParams,
+  MemoryProviderOpenResult,
+} from "./memory-provider-types.js";
 
 export type ContextEngineFactoryContext = {
   config?: OpenClawConfig;
@@ -58,25 +67,17 @@ export type RegisteredCompactionProvider = {
   ownerPluginId?: string;
 };
 
-export type MemoryEmbeddingBatchChunk = {
-  text: string;
+export type MemoryEmbeddingBatchChunk = EmbeddingBatchChunk & {
   embeddingInput?: EmbeddingInput;
 };
 
-export type MemoryEmbeddingBatchOptions = {
-  agentId: string;
+export type MemoryEmbeddingBatchOptions = Omit<EmbeddingBatchOptions, "chunks"> & {
   chunks: MemoryEmbeddingBatchChunk[];
-  wait: boolean;
-  concurrency: number;
-  pollIntervalMs: number;
-  timeoutMs: number;
-  debug: (message: string, data?: Record<string, unknown>) => void;
 };
 
 export type MemoryEmbeddingProviderCallOptions = Pick<EmbeddingProviderCallOptions, "signal">;
 
-export type MemoryEmbeddingProviderRuntime = EmbeddingProviderRuntime & {
-  sourceWideBatchEmbed?: boolean;
+export type MemoryEmbeddingProviderRuntime = Omit<EmbeddingProviderRuntime, "batchEmbed"> & {
   batchEmbed?: (options: MemoryEmbeddingBatchOptions) => Promise<number[][] | null>;
 };
 
@@ -247,15 +248,39 @@ export type MemoryPluginRuntime = {
     requesterSessionKey: string | undefined;
     sandboxed: boolean;
     hits: MemorySearchResult[];
+    /** A sessionless host or operator caller acting for `agentId` may keep only that agent's hits. */
+    trustedAgentScope?: boolean;
+    /** The session caller's host-granted recall pass, exactly as its tool context received it. */
+    conversationRecall?: ConversationRecallContext;
   }): Promise<MemorySearchResult[]>;
+  /** The classifier consumes pinned read sources without probing Gateway-local paths. */
+  supportsWorkspaceMemoryReadSources?: true;
   classifyWorkspaceMemoryPaths?(params: {
     cfg: OpenClawConfig;
     agentId: string;
     workspaceDir: string;
     relativePaths: string[];
+    /** Already-read remote files; an absent canonical path must remain untrusted. */
+    readSources?: readonly { relativePath: string; canonicalRelativePath?: string }[];
   }): Promise<Array<{ relativePath: string; originClass: MemoryOriginClass }>>;
+  /** Fence and drain managers consuming these exact retiring capability objects. */
+  prepareReload?(change: {
+    retireRuntime: boolean;
+    retiringEmbeddingProviders: readonly MemoryEmbeddingProviderAdapter[];
+  }): {
+    drain(): Promise<void | { errors: readonly unknown[] }>;
+    resume(): void;
+  };
   closeMemorySearchManager?(params: { cfg: OpenClawConfig; agentId: string }): Promise<void>;
   closeAllMemorySearchManagers?(): Promise<void>;
+};
+
+/** Additive runtime; lifecycle hooks share the existing memory runtime cleanup owner. */
+export type MemoryProviderRuntime = Pick<
+  MemoryPluginRuntime,
+  "prepareReload" | "closeMemorySearchManager" | "closeAllMemorySearchManagers"
+> & {
+  open(params: MemoryProviderOpenParams): Promise<MemoryProviderOpenResult>;
 };
 
 type MemoryPluginPublicArtifactContentType = "markdown" | "json" | "text";
@@ -277,7 +302,11 @@ export type MemoryPluginCapability = {
   promptBuilder?: MemoryPromptSectionBuilder;
   flushPlanResolver?: MemoryFlushPlanResolver;
   runtime?: MemoryPluginRuntime;
+  /** Provider-neutral host integration; preferred over runtime when present. */
+  providerRuntime?: MemoryProviderRuntime;
   publicArtifacts?: MemoryPluginPublicArtifactsProvider;
+  /** Agent-facing tools Active Memory may use for provider-owned deep recall. */
+  recallToolNames?: readonly string[];
   /** Local deterministic recall tool required by provider-owned direct lookup. */
   deterministicRecallToolName?: string;
   /** Whether recall may read protected same-agent private session transcripts. */

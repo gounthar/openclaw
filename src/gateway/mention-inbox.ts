@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { flattenMarkdownToPlainText } from "@openclaw/normalization-core/markdown-plain-text";
+import type { DatabaseSync } from "node:sqlite";
 import { err, ok, type Result } from "@openclaw/normalization-core/result";
-import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import {
   ErrorCodes,
   MAX_HUMAN_MENTIONS,
@@ -11,36 +10,44 @@ import {
   type MentionInboxItem,
   type MentionsListResult,
 } from "../../packages/gateway-protocol/src/index.js";
+import { updateSessionProfileInvolvement } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { isIncognitoSessionKey } from "../routing/session-key.js";
 import { onSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
+import { sessionChanges } from "../sessions/session-row-changes.js";
+import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { onUserProfilesChanged, readUserProfileVersion } from "../state/user-profile-events.js";
 import { createHumanMentionPolicy, humanMentionDisplayLabel } from "./human-mention-policy.js";
+import { formatMentionExcerpt, formatMentionSessionTitle } from "./mention-inbox-presentation.js";
+import {
+  MAX_MENTION_SOURCES,
+  MENTION_RETENTION_MS,
+  readMentionStoreSnapshot,
+  writeMentionStoreChanges,
+  type MentionStoreHead,
+  type MentionStoreMessage,
+  type MentionStoreSource,
+} from "./mention-inbox-store.js";
 import type { MentionCommittedInput, MentionInbox } from "./mention-inbox.types.js";
 import type { GatewayBroadcastToConnIdsFn } from "./server-broadcast-types.js";
 import type { GatewayClient } from "./server-methods/types.js";
 import { resolveSessionSharingTarget } from "./session-sharing.js";
-import { deriveSessionTitle } from "./session-utils-core.js";
 
-const RETENTION_MS = 7 * 24 * 60 * 60_000;
 const MAX_GLOBAL_ITEMS = 10_000;
-const MAX_PROCESSED_SOURCES = 10_000;
 const log = createSubsystemLogger("gateway/mentions");
 
 type StoredMention = {
   id: string;
   recipientProfileId: string;
   source: ProcessedSource;
-  message: {
-    sessionId: string;
-    content: Omit<
-      MentionInboxItem,
-      "id" | "senderLabel" | "senderAvatarUrl" | "sessionTitle" | "expiresAt"
-    >;
-  };
+  message: MentionStoreMessage;
 };
 
 type ProcessedSource = {
+  key: string;
+  sequence: number;
   expiresAt: number;
   /** Null retains consumption after dismissal, eviction, or intentional non-delivery. */
   recipients: Map<string, StoredMention | null>;
@@ -56,29 +63,127 @@ type MentionNotification = {
   isCurrent: () => boolean;
 };
 
-/** One Gateway lifetime owns temporary mention retention, acknowledgement, and replay suppression. */
+type SharingTargets = Map<
+  string,
+  { sessionKey: string; target: ReturnType<typeof resolveSessionSharingTarget> }
+>;
+
+/** Durable sources own retention and replay; each Gateway keeps disposable projection indexes. */
 export function createMentionInbox(params: {
+  scheduler: GatewayScheduler;
   gatewayInstanceId: string;
   getRuntimeConfig: () => OpenClawConfig;
   getClients: () => Iterable<GatewayClient>;
   broadcastToConnIds: GatewayBroadcastToConnIdsFn;
   onMentionCreated?: (notification: MentionNotification) => void;
 }): MentionInbox {
+  const scheduler = params.scheduler.scope();
   const policy = createHumanMentionPolicy(params);
   const items = new Map<string, StoredMention>();
   const itemsByProfile = new Map<string, Set<StoredMention>>();
   const processed = new Map<string, ProcessedSource>();
+  const dirtySources = new Set<string>();
+  let head: MentionStoreHead = { revision: -1, nextSequence: 0 };
   const views = new WeakMap<GatewayClient, { signature: string; revision: number }>();
-  let active = true;
+  const connectedTargets: SharingTargets = new Map();
+  let targetConfig: OpenClawConfig | undefined;
   let profileVersion = readUserProfileVersion();
-  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
   let capacityReported = false;
   let profileInvalidationPending = false;
   let nextExpiryAt = Infinity;
 
-  function removeItem(item: StoredMention | null | undefined): boolean {
-    if (!item || !items.delete(item.id)) {
+  function synchronize(database?: DatabaseSync): boolean {
+    const snapshot = readMentionStoreSnapshot(head.revision, database);
+    if (!snapshot) {
       return false;
+    }
+    items.clear();
+    itemsByProfile.clear();
+    processed.clear();
+    dirtySources.clear();
+    nextExpiryAt = Infinity;
+    for (const stored of snapshot.sources) {
+      const source: ProcessedSource = {
+        key: stored.key,
+        sequence: stored.sequence,
+        expiresAt: stored.expiresAt,
+        recipients: new Map(),
+      };
+      processed.set(source.key, source);
+      nextExpiryAt = Math.min(nextExpiryAt, source.expiresAt);
+      for (const [profileId, id] of stored.recipients) {
+        const item: StoredMention | null =
+          id && stored.message
+            ? { id, recipientProfileId: profileId, source, message: stored.message }
+            : null;
+        source.recipients.set(profileId, item);
+        if (item) {
+          items.set(item.id, item);
+          indexItem(item, false);
+        }
+      }
+    }
+    head = snapshot.head;
+    // A restart or another writer may have preceded this process's profile events.
+    profileVersion = -1;
+    return true;
+  }
+
+  function mutate<T>(operation: () => T): T {
+    try {
+      return runOpenClawStateWriteTransaction(
+        ({ db }) => {
+          synchronize(db);
+          expireItems();
+          reconcileProfiles();
+          const result = operation();
+          const changes = new Map<string, MentionStoreSource | undefined>();
+          for (const key of dirtySources) {
+            const source = processed.get(key);
+            if (!source) {
+              changes.set(key, undefined);
+              continue;
+            }
+            const message = [...source.recipients.values()].find((item) => item !== null)?.message;
+            changes.set(key, {
+              key,
+              sequence: source.sequence,
+              expiresAt: source.expiresAt,
+              recipients: [...source.recipients].map(([profileId, item]) => [
+                profileId,
+                item?.id ?? null,
+              ]),
+              ...(message ? { message } : {}),
+            });
+          }
+          head = writeMentionStoreChanges(db, head, changes);
+          return result;
+        },
+        {},
+        { operationLabel: "mentions.write" },
+      );
+    } catch (error) {
+      // Uncommitted indexes are never published; the next read rebuilds from durable state.
+      head = { revision: -1, nextSequence: 0 };
+      throw error;
+    } finally {
+      dirtySources.clear();
+    }
+  }
+
+  function maintain(): boolean {
+    const changed = synchronize();
+    const maintenance =
+      scheduler.now() >= nextExpiryAt || profileVersion !== readUserProfileVersion();
+    if (maintenance) {
+      mutate(() => undefined);
+    }
+    return changed || maintenance;
+  }
+
+  function removeItem(item: StoredMention | null | undefined): void {
+    if (!item || !items.delete(item.id)) {
+      return;
     }
     const profileItems = itemsByProfile.get(item.recipientProfileId);
     profileItems?.delete(item);
@@ -86,7 +191,7 @@ export function createMentionInbox(params: {
       itemsByProfile.delete(item.recipientProfileId);
     }
     item.source.recipients.set(item.recipientProfileId, null);
-    return true;
+    dirtySources.add(item.source.key);
   }
 
   function trimItems(
@@ -99,20 +204,21 @@ export function createMentionInbox(params: {
     }
   }
 
-  function indexItem(item: StoredMention): void {
+  function indexItem(item: StoredMention, trim = true): void {
     const retained = itemsByProfile.get(item.recipientProfileId) ?? new Set<StoredMention>();
     retained.add(item);
     itemsByProfile.set(item.recipientProfileId, retained);
-    trimItems(retained, MENTION_INBOX_MAX_ITEMS);
+    if (trim) {
+      trimItems(retained, MENTION_INBOX_MAX_ITEMS);
+    }
   }
 
-  function expireItems(): boolean {
-    const now = Date.now();
+  function expireItems(): void {
+    const now = scheduler.now();
     // Retention is bounded, but scanning it on every read and delivery makes a burst quadratic.
     if (now < nextExpiryAt) {
-      return false;
+      return;
     }
-    let changed = false;
     let next = Infinity;
     for (const [key, source] of processed) {
       if (source.expiresAt > now) {
@@ -120,15 +226,15 @@ export function createMentionInbox(params: {
         continue;
       }
       for (const item of source.recipients.values()) {
-        changed = removeItem(item) || changed;
+        removeItem(item);
       }
       processed.delete(key);
+      dirtySources.add(key);
     }
     nextExpiryAt = next;
-    if (processed.size < MAX_PROCESSED_SOURCES) {
+    if (processed.size < MAX_MENTION_SOURCES) {
       capacityReported = false;
     }
-    return changed;
   }
 
   function reconcileProfiles(): void {
@@ -141,6 +247,9 @@ export function createMentionInbox(params: {
       const recipients = new Map<string, StoredMention | null>();
       for (const [profileId, item] of source.recipients) {
         const canonical = policy.readProfile(profileId)?.profileId ?? profileId;
+        if (canonical !== profileId || recipients.has(canonical)) {
+          dirtySources.add(source.key);
+        }
         if (!recipients.has(canonical)) {
           recipients.set(canonical, item);
           if (item) {
@@ -161,33 +270,34 @@ export function createMentionInbox(params: {
     }
     itemsByProfile.clear();
     for (const item of items.values()) {
-      if (policy.readProfile(item.recipientProfileId)) {
-        indexItem(item);
-      } else {
-        removeItem(item);
-      }
+      // An unresolved display can mean a transient read failure, not a deleted profile.
+      // Current authorization hides it; original retention still owns durable deletion.
+      indexItem(item);
     }
   }
 
-  function currentTarget(
-    item: StoredMention,
-    cfg: OpenClawConfig,
-    targets?: Map<string, ReturnType<typeof resolveSessionSharingTarget>>,
-  ) {
+  function currentTarget(item: StoredMention, cfg: OpenClawConfig, targets?: SharingTargets) {
     const { source, message } = item;
     const { agentId, sessionKey, senderProfileId } = message.content;
-    if (!active || items.get(item.id) !== item || source.expiresAt <= Date.now()) {
+    if (
+      scheduler.signal.aborted ||
+      items.get(item.id) !== item ||
+      source.expiresAt <= scheduler.now()
+    ) {
       return undefined;
     }
     const key = JSON.stringify([agentId, sessionKey]);
-    let resolved = targets?.get(key);
+    let resolved = targets?.get(key)?.target;
     if (resolved === undefined) {
       resolved = resolveSessionSharingTarget({
         cfg,
         sessionKey,
         agentId,
       });
-      targets?.set(key, resolved);
+      if (targets?.size === MAX_GLOBAL_ITEMS) {
+        targets.clear();
+      }
+      targets?.set(key, { sessionKey, target: resolved });
     }
     if (!resolved || resolved.entry.sessionId !== message.sessionId) {
       return undefined;
@@ -216,20 +326,15 @@ export function createMentionInbox(params: {
       senderProfileId: current.sender?.profileId ?? content.senderProfileId,
       senderLabel: humanMentionDisplayLabel(current.sender?.label, content.senderProfileId),
       ...(current.sender ? { senderAvatarUrl: current.sender.avatarUrl } : {}),
-      sessionTitle:
-        truncateUtf16Safe(
-          (deriveSessionTitle(current.target.entry) ?? "Conversation")
-            .replace(/[\p{Cc}\p{Cf}]/gu, " ")
-            .replace(/\s+/gu, " ")
-            .trim(),
-          256,
-        ) || "Conversation",
+      sessionTitle: formatMentionSessionTitle(current.target.entry),
     };
   }
 
   function readView(
     client: GatewayClient | null,
     cfg = params.getRuntimeConfig(),
+    remember = true,
+    targets: SharingTargets = new Map(),
   ): Result<MentionsListResult, ErrorShape> {
     const identified = policy.identify(client, cfg);
     if (!identified.ok) {
@@ -237,7 +342,6 @@ export function createMentionInbox(params: {
     }
     const requester = identified.value;
     const visible: MentionInboxItem[] = [];
-    const targets = new Map<string, ReturnType<typeof resolveSessionSharingTarget>>();
     const profileItems = itemsByProfile.get(requester.profile.profileId);
     for (const item of [...(profileItems ?? [])].toReversed()) {
       const current = currentTarget(item, cfg, targets);
@@ -250,7 +354,7 @@ export function createMentionInbox(params: {
       .digest("hex");
     const previous = client && views.get(client);
     const revision = previous ? previous.revision + Number(signature !== previous.signature) : 0;
-    if (client) {
+    if (client && remember) {
       views.set(client, { signature, revision });
     }
     return ok({ gatewayInstanceId: params.gatewayInstanceId, revision, items: visible });
@@ -258,12 +362,16 @@ export function createMentionInbox(params: {
 
   function refreshConnectedViews(): void {
     const cfg = params.getRuntimeConfig();
+    if (targetConfig !== cfg) {
+      connectedTargets.clear();
+      targetConfig = cfg;
+    }
     for (const client of params.getClients()) {
       if (!client.connId) {
         continue;
       }
       const previous = views.get(client);
-      const result = readView(client, cfg);
+      const result = readView(client, cfg, true, connectedTargets);
       if (
         !result.ok ||
         (previous ? previous.revision === result.value.revision : result.value.items.length === 0)
@@ -278,38 +386,56 @@ export function createMentionInbox(params: {
     }
   }
 
-  function scheduleExpiry(): void {
-    if (expiryTimer || processed.size === 0 || !active) {
+  function scheduleExpiry(retryAfterMs?: number): void {
+    if (scheduler.signal.aborted || (processed.size === 0 && retryAfterMs === undefined)) {
       return;
     }
-    expiryTimer = setTimeout(
-      () => {
-        expiryTimer = undefined;
-        refresh();
-      },
-      Math.max(1, nextExpiryAt - Date.now()),
-    );
-    expiryTimer.unref?.();
+    scheduler.schedule({
+      id: `mentions:expiry:${params.gatewayInstanceId}`,
+      mode: "earliest",
+      ...(retryAfterMs === undefined ? { atMs: nextExpiryAt } : { delayMs: retryAfterMs }),
+      run: refresh,
+    });
   }
 
   function refresh(): void {
-    if (!active) {
+    if (scheduler.signal.aborted) {
       return;
     }
     try {
-      expireItems();
-      reconcileProfiles();
+      maintain();
       refreshConnectedViews();
       scheduleExpiry();
     } catch {
-      log.warn("Unable to refresh the temporary mention Inbox; current reads will retry.");
+      log.warn("Unable to refresh the mention Inbox; current reads will retry.");
+      // A failed expiry write must not retire cleanup while the Gateway remains alive.
+      scheduleExpiry(60_000);
     }
   }
 
-  function invalidate(): void {
+  function invalidateTargets(sessionKey?: string): void {
+    if (!sessionKey) {
+      connectedTargets.clear();
+      return;
+    }
+    for (const [key, cached] of connectedTargets) {
+      if (cached.sessionKey === sessionKey || cached.target?.storeKeys.includes(sessionKey)) {
+        connectedTargets.delete(key);
+      }
+    }
+  }
+
+  function invalidate(sessionKey?: string): void {
+    invalidateTargets(sessionKey);
     policy.invalidateDirectory();
     refresh();
   }
+
+  // Only connected-view refreshes retain targets across calls. Committed row publications
+  // invalidate them; direct reads and delayed push authority keep their fresh exact reads.
+  const stopRows = sessionChanges.subscribe((change) =>
+    invalidateTargets("sessionKey" in change ? change.sessionKey : undefined),
+  );
 
   // Profile writes publish after commit. The microtask also follows role-policy cache invalidation.
   const stopProfiles = onUserProfilesChanged(() => {
@@ -324,13 +450,9 @@ export function createMentionInbox(params: {
   });
   const stopSessions = onSessionIdentityMutation(() => invalidate());
 
-  function readOperation<T>(operation: () => Result<T, ErrorShape>): Result<T, ErrorShape> {
-    if (active) {
-      try {
-        return operation();
-      } catch {
-        log.warn("The temporary mention Inbox could not read its current authorization.");
-      }
+  function unavailable(warn = false): Result<never, ErrorShape> {
+    if (warn) {
+      log.warn("The mention Inbox could not read or save its current state. Reconnect to retry.");
     }
     return err(
       errorShape(ErrorCodes.UNAVAILABLE, "The mention Inbox is unavailable. Reconnect to retry.", {
@@ -339,17 +461,41 @@ export function createMentionInbox(params: {
     );
   }
 
+  function readOperation<T>(operation: () => Result<T, ErrorShape>): Result<T, ErrorShape> {
+    if (!scheduler.signal.aborted) {
+      try {
+        return operation();
+      } catch {
+        return unavailable(true);
+      }
+    }
+    return unavailable();
+  }
+
+  refresh();
+
   return {
-    mentionable: (...args: Parameters<typeof policy.mentionable>) =>
-      readOperation(() => policy.mentionable(...args)),
+    async mentionable(client, input, publish) {
+      let preparationFailure: Result<never, ErrorShape> | undefined;
+      try {
+        // A committed profile change can invalidate preparation before this continuation runs.
+        while (policy.needsDirectoryPreparation()) {
+          await policy.prepareDirectory();
+        }
+      } catch {
+        preparationFailure = unavailable(true);
+      }
+      // Current policy selection and response publication must not cross another await.
+      publish(preparationFailure ?? readOperation(() => policy.mentionable(client, input)));
+    },
     validateRecipients: (...args: Parameters<typeof policy.validateRecipients>) =>
       readOperation(() => policy.validateRecipients(...args)),
     list(client: GatewayClient | null): Result<MentionsListResult, ErrorShape> {
       return readOperation(() => {
-        reconcileProfiles();
-        if (expireItems()) {
+        if (maintain()) {
           refreshConnectedViews();
         }
+        scheduleExpiry();
         return readView(client);
       });
     },
@@ -358,17 +504,20 @@ export function createMentionInbox(params: {
       ids: readonly string[],
     ): Result<MentionsListResult, ErrorShape> {
       return readOperation(() => {
-        reconcileProfiles();
-        expireItems();
-        const current = readView(client);
-        if (!current.ok) {
-          return current;
-        }
-        const owned = new Set(current.value.items.map((item) => item.id));
-        for (const id of ids) {
-          if (owned.has(id)) {
-            removeItem(items.get(id));
+        const result = mutate(() => {
+          const current = readView(client, params.getRuntimeConfig(), false);
+          if (current.ok) {
+            const owned = new Set(current.value.items.map((item) => item.id));
+            for (const id of ids) {
+              if (owned.has(id)) {
+                removeItem(items.get(id));
+              }
+            }
           }
+          return current;
+        });
+        if (!result.ok) {
+          return result;
         }
         refresh();
         return readView(client);
@@ -376,7 +525,7 @@ export function createMentionInbox(params: {
     },
     recordCommittedInput(input: MentionCommittedInput): void {
       try {
-        if (!active || input.recipientProfileIds.length === 0) {
+        if (scheduler.signal.aborted || input.recipientProfileIds.length === 0) {
           return;
         }
         const references = [
@@ -394,112 +543,144 @@ export function createMentionInbox(params: {
           log.warn("Skipped mention delivery with invalid committed references.");
           return;
         }
-        expireItems();
-        reconcileProfiles();
-        const cfg = params.getRuntimeConfig();
-        const resolved = resolveSessionSharingTarget({
-          cfg,
-          sessionKey: input.sessionKey,
-          agentId: input.agentId,
-        });
-        if (!resolved || resolved.entry.sessionId !== input.sessionId) {
-          log.debug("Skipped mention delivery because its committed session changed.");
-          return;
-        }
-        const sourceKey = createHash("sha256")
-          .update(
-            JSON.stringify([
-              resolved.agentId,
-              resolved.canonicalKey,
-              input.sessionId,
-              input.sourceId,
-            ]),
-          )
-          .digest("hex");
-        if (processed.has(sourceKey)) {
-          return;
-        }
-        // Never evict consumption early to make room: doing so could re-alert a dismissed message.
-        if (processed.size >= MAX_PROCESSED_SOURCES) {
-          if (!capacityReported) {
-            log.warn(
-              "Temporary mention retention reached its replay budget; new mention alerts are skipped until retained sources expire.",
+        const committed = mutate<StoredMention[]>(() => {
+          const cfg = params.getRuntimeConfig();
+          const resolved = resolveSessionSharingTarget({
+            cfg,
+            sessionKey: input.sessionKey,
+            agentId: input.agentId,
+          });
+          if (
+            !resolved ||
+            resolved.entry.sessionId !== input.sessionId ||
+            resolved.entry.incognito === true ||
+            isIncognitoSessionKey(resolved.canonicalKey)
+          ) {
+            log.debug("Skipped mention delivery because its committed session changed.");
+            return [];
+          }
+          const senderProfile = policy.readProfile(input.senderProfileId);
+          const mentionedProfiles = input.recipientProfileIds.flatMap((id) => {
+            const recipient = policy.recipientProfile(
+              id,
+              {
+                agentId: resolved.agentId,
+                sessionKey: resolved.canonicalKey,
+                entry: resolved.entry,
+              },
+              cfg,
             );
-            capacityReported = true;
-          }
-          return;
-        }
-        const now = Date.now();
-        const source: ProcessedSource = { expiresAt: now + RETENTION_MS, recipients: new Map() };
-        processed.set(sourceKey, source);
-        nextExpiryAt = Math.min(nextExpiryAt, source.expiresAt);
-        const sender = policy.readProfile(input.senderProfileId);
-        const target = {
-          agentId: resolved.agentId,
-          sessionKey: resolved.canonicalKey,
-          entry: resolved.entry,
-        };
-        const excerpt = input.excerpt
-          ? truncateUtf16Safe(
-              flattenMarkdownToPlainText(truncateUtf16Safe(input.excerpt, 2_048))
-                .replace(/[\p{Cc}\p{Cf}]/gu, " ")
-                .replace(/\s+/gu, " ")
-                .trim(),
-              280,
-            )
-          : undefined;
-        // Recipients share immutable message data; consumed sources retain only replay tombstones.
-        const message: StoredMention["message"] = {
-          sessionId: input.sessionId,
-          content: {
-            senderProfileId: sender?.profileId ?? input.senderProfileId,
-            sessionKey: target.sessionKey,
-            agentId: target.agentId,
-            messageId: input.messageId,
-            createdAt: now,
-            ...(excerpt ? { excerpt } : {}),
-          },
-        };
-        const created: StoredMention[] = [];
-        let unavailableRecipients = 0;
-        for (const profileId of input.recipientProfileIds) {
-          const recipient = policy.recipientProfile(profileId, target, cfg);
-          const canonicalId = recipient?.profileId ?? profileId;
-          if (source.recipients.has(canonicalId)) {
-            continue;
-          }
-          source.recipients.set(canonicalId, null);
-          if (!sender || !recipient || sender.profileId === recipient.profileId) {
-            unavailableRecipients += 1;
-            continue;
-          }
-          const item: StoredMention = {
-            id: randomUUID(),
-            recipientProfileId: recipient.profileId,
-            source,
-            message,
-          };
-          items.set(item.id, item);
-          source.recipients.set(recipient.profileId, item);
-          indexItem(item);
-          trimItems(items, MAX_GLOBAL_ITEMS);
-          created.push(item);
-        }
-        if (unavailableRecipients > 0) {
-          log.debug(
-            `Skipped ${unavailableRecipients} unavailable mention recipients for committed input.`,
+            return senderProfile && recipient && senderProfile.profileId !== recipient.profileId
+              ? [recipient.profileId]
+              : [];
+          });
+          updateSessionProfileInvolvement(
+            {
+              agentId: resolved.agentId,
+              sessionKey: resolved.storeKey,
+              storePath: resolved.storePath,
+            },
+            {
+              expectedSessionId: input.sessionId,
+              profileIds: mentionedProfiles,
+              change: { kind: "mention", source: input.committedSource },
+            },
           );
-        }
+          const sourceKey = createHash("sha256")
+            .update(
+              JSON.stringify([
+                resolved.agentId,
+                resolved.canonicalKey,
+                input.sessionId,
+                input.sourceId,
+              ]),
+            )
+            .digest("hex");
+          if (processed.has(sourceKey)) {
+            return [];
+          }
+          // Never evict consumption early to make room: doing so could re-alert a dismissed message.
+          if (processed.size >= MAX_MENTION_SOURCES) {
+            if (!capacityReported) {
+              log.warn(
+                "Mention retention reached its replay budget; new mention alerts are skipped until retained sources expire.",
+              );
+              capacityReported = true;
+            }
+            return [];
+          }
+          const now = scheduler.now();
+          const source: ProcessedSource = {
+            key: sourceKey,
+            sequence: head.nextSequence++,
+            expiresAt: now + MENTION_RETENTION_MS,
+            recipients: new Map(),
+          };
+          processed.set(sourceKey, source);
+          dirtySources.add(sourceKey);
+          nextExpiryAt = Math.min(nextExpiryAt, source.expiresAt);
+          const sender = policy.readProfile(input.senderProfileId);
+          const target = {
+            agentId: resolved.agentId,
+            sessionKey: resolved.canonicalKey,
+            entry: resolved.entry,
+          };
+          const excerpt = formatMentionExcerpt(input.excerpt);
+          // Recipients share immutable message data; consumed sources retain only replay tombstones.
+          const message: StoredMention["message"] = {
+            sessionId: input.sessionId,
+            content: {
+              senderProfileId: sender?.profileId ?? input.senderProfileId,
+              sessionKey: target.sessionKey,
+              agentId: target.agentId,
+              messageId: input.messageId,
+              createdAt: now,
+              ...(excerpt ? { excerpt } : {}),
+            },
+          };
+          const created: StoredMention[] = [];
+          let unavailableRecipients = 0;
+          for (const profileId of input.recipientProfileIds) {
+            const recipient = policy.recipientProfile(profileId, target, cfg);
+            const canonicalId = recipient?.profileId ?? profileId;
+            if (source.recipients.has(canonicalId)) {
+              continue;
+            }
+            source.recipients.set(canonicalId, null);
+            if (!sender || !recipient || sender.profileId === recipient.profileId) {
+              unavailableRecipients += 1;
+              continue;
+            }
+            const item: StoredMention = {
+              id: randomUUID(),
+              recipientProfileId: recipient.profileId,
+              source,
+              message,
+            };
+            items.set(item.id, item);
+            source.recipients.set(recipient.profileId, item);
+            indexItem(item);
+            trimItems(items, MAX_GLOBAL_ITEMS);
+            created.push(item);
+          }
+          if (unavailableRecipients > 0) {
+            log.debug(
+              `Skipped ${unavailableRecipients} unavailable mention recipients for committed input.`,
+            );
+          }
+          return created;
+        });
         refresh();
         if (!params.onMentionCreated) {
           return;
         }
-        for (const item of created) {
-          const current = currentTarget(item, params.getRuntimeConfig());
-          if (!current) {
+        for (const item of committed) {
+          const retained = items.get(item.id);
+          const current = retained && currentTarget(retained, params.getRuntimeConfig());
+          if (!retained || !current) {
             continue;
           }
-          const projected = projectItem(item, current);
+          const projected = projectItem(retained, current);
           params.onMentionCreated({
             id: item.id,
             recipientProfileId: current.recipient.profileId,
@@ -509,7 +690,12 @@ export function createMentionInbox(params: {
             sessionTitle: projected.sessionTitle,
             isCurrent: () => {
               try {
-                return Boolean(currentTarget(item, params.getRuntimeConfig()));
+                if (scheduler.signal.aborted) {
+                  return false;
+                }
+                maintain();
+                const latest = items.get(item.id);
+                return Boolean(latest && currentTarget(latest, params.getRuntimeConfig()));
               } catch {
                 return false;
               }
@@ -521,18 +707,17 @@ export function createMentionInbox(params: {
       }
     },
     invalidate,
-    dispose(): void {
-      active = false;
+    dispose(): Promise<void> {
+      scheduler.beginClose();
       stopProfiles();
       stopSessions();
+      stopRows();
+      connectedTargets.clear();
       policy.dispose();
-      if (expiryTimer) {
-        clearTimeout(expiryTimer);
-        expiryTimer = undefined;
-      }
       items.clear();
       itemsByProfile.clear();
       processed.clear();
+      return scheduler.stop();
     },
   };
 }

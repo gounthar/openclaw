@@ -15,7 +15,14 @@ import {
   getActiveDiagnosticTraceContext,
   runWithDiagnosticTraceContext,
 } from "../../../infra/diagnostic-trace-context.js";
+import {
+  getActiveGatewayRootWorkCount,
+  markGatewayRestartDraining,
+  resetGatewayWorkAdmission,
+} from "../../../process/gateway-work-admission.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
+import { createGatewayMethodRegistry } from "../../methods/registry.js";
+import { agentWaitHandler } from "../../server-methods/agent-wait.js";
 import { createLazyCoreHandlers } from "../../server-methods/lazy-core-handlers.js";
 import type { GatewayRequestHandler, RespondFn } from "../../server-methods/types.js";
 import {
@@ -319,7 +326,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
     "records %s rejection without a handler sample",
     async (reason) => {
       const handler = vi.fn<GatewayRequestHandler>(({ respond }) => respond(true));
-      const fixture = createRequest(handler, "tasks.list");
+      const fixture = createRequest(handler, "sessions.list");
       if (reason === "authorization") {
         fixture.client.connect.scopes = [];
       } else {
@@ -481,16 +488,66 @@ describe("authenticated Gateway RPC diagnostics", () => {
     expect(registry).not.toHaveBeenCalled();
   });
 
-  it("collapses arbitrary request method names into fixed labels", async () => {
+  it("labels registered methods exactly and folds arbitrary names across registry replacement", async () => {
     const { events } = observeRequests();
-    for (let index = 0; index < 1000; index++) {
-      createGatewayRpcDiagnostics(`private-method-${index}`, undefined, {});
-    }
-    createGatewayRpcDiagnostics("private-plugin-method", undefined, {
-      "private-plugin-method": () => {},
-    });
+    let registry = createGatewayMethodRegistry([
+      {
+        name: "workboard.cards.list",
+        handler: () => {},
+        owner: { kind: "plugin", pluginId: "workboard" },
+        scope: "operator.read",
+      },
+    ]);
+    const getRegistry = () => registry;
+    createGatewayRpcDiagnostics("node.invoke.result", getRegistry, {});
+    createGatewayRpcDiagnostics("workboard.cards.list", getRegistry, {});
+    createGatewayRpcDiagnostics("aux.status", undefined, { "aux.status": () => {} });
     await waitForDiagnosticEventsDrained();
-    expect(new Set(events.map((event) => event.method))).toEqual(new Set(["unknown", "other"]));
+    expect(events.map((event) => event.method)).toEqual([
+      "node.invoke.result",
+      "workboard.cards.list",
+      "aux.status",
+    ]);
+    events.length = 0;
+    registry = createGatewayMethodRegistry([]);
+    createGatewayRpcDiagnostics("workboard.cards.list", getRegistry, {});
+    for (let index = 0; index < 1000; index++) {
+      createGatewayRpcDiagnostics(`private-method-${index}`, getRegistry, {});
+    }
+    createGatewayRpcDiagnostics("constructor", getRegistry, {});
+    createGatewayRpcDiagnostics("__proto__", getRegistry, {});
+    await waitForDiagnosticEventsDrained();
+    expect(new Set(events.map((event) => event.method))).toEqual(new Set(["other"]));
     expect(JSON.stringify(events)).not.toContain("private-");
+  });
+});
+
+describe("Gateway observation response ordering", () => {
+  afterEach(() => resetGatewayWorkAdmission());
+  it("does not send a second response when shutdown follows a completed observation", async () => {
+    const fixture = createDispatchTestHarness({
+      extraHandlers: { "agent.wait": agentWaitHandler },
+      buildRequestContext: () => ({
+        dedupe: new Map(),
+        chatAbortControllers: new Map(),
+        chatQueuedTurns: new Map(),
+        getRuntimeConfig: () => ({}),
+      }),
+    });
+    const shutdown = fixture.awaitResponseFrame("completed").then(() => {
+      markGatewayRestartDraining("stop (SIGTERM)");
+    });
+    await fixture.dispatcher.dispatch(
+      {
+        type: "req",
+        id: "completed",
+        method: "agent.wait",
+        params: { runId: "missing-completed", timeoutMs: 0 },
+      },
+      createOperatorWsClient(),
+    );
+    await shutdown;
+    expect(fixture.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ ok: true }));
+    expect(getActiveGatewayRootWorkCount()).toBe(0);
   });
 });

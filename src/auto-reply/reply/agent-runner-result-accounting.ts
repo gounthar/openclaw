@@ -111,8 +111,8 @@ export async function accountAgentTurn(context: AgentTurnAccountingContext) {
   const fallbackModel = execution.resolved.model;
   const fallbackExhausted = execution.fallback.exhausted;
   const fallbackAttempts = execution.fallback.attempts;
-  const directlySentBlockKeys = execution.directlySentBlockKeys;
-  const directlySentBlockPayloads = execution.directlySentBlockPayloads;
+  const hasDirectlySentBlockReply = execution.hasDirectlySentBlockReply;
+  const directBlockDeliveries = execution.directBlockDeliveries;
   const terminalFailurePayload = execution.terminalFailurePayload;
   const { autoCompactionCount, didLogHeartbeatStrip } = execution;
 
@@ -258,10 +258,8 @@ export async function accountAgentTurn(context: AgentTurnAccountingContext) {
     }
   }
   const runtimeContextTokens =
-    typeof runResult.meta?.agentMeta?.contextTokens === "number" &&
-    Number.isFinite(runResult.meta.agentMeta.contextTokens) &&
-    runResult.meta.agentMeta.contextTokens > 0
-      ? Math.floor(runResult.meta.agentMeta.contextTokens)
+    typeof ctxTokens === "number" && Number.isFinite(ctxTokens) && ctxTokens > 0
+      ? Math.floor(ctxTokens)
       : undefined;
   const resolvedContextTokens =
     runtimeContextTokens === undefined
@@ -301,7 +299,7 @@ export async function accountAgentTurn(context: AgentTurnAccountingContext) {
     cfg,
     agentDir: followupRun.run.agentDir,
     usage,
-    lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+    lastCallUsage,
     currentContextSnapshot,
     promptTokens,
     isHeartbeat,
@@ -344,8 +342,8 @@ export async function accountAgentTurn(context: AgentTurnAccountingContext) {
     configuredFallbackModel,
     contextTokensUsed,
     didLogHeartbeatStrip,
-    directlySentBlockKeys,
-    directlySentBlockPayloads,
+    hasDirectlySentBlockReply,
+    directBlockDeliveries,
     fallbackAttempts,
     fallbackExhausted,
     fallbackTransition,
@@ -428,7 +426,8 @@ export async function accountFollowupTurn(params: {
       nextSessionFile: queueKey,
       nextProvider: accounting.sessionModel.provider,
       nextModel: accounting.sessionModel.model,
-      nextModelOverrideSource: entry?.modelOverrideSource,
+      nextModelOverrideSource:
+        entry?.modelOverrideSource === "default" ? undefined : entry?.modelOverrideSource,
       nextAuthProfileId: entry?.authProfileOverride,
       nextAuthProfileIdSource: resolveCollapsedSessionAuthPinSource(entry),
     });

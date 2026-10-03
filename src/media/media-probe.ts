@@ -5,6 +5,7 @@ import {
   asSafeIntegerInRange,
 } from "@openclaw/normalization-core/number-coercion";
 import { asOptionalRecord as readRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { runFfprobe } from "./ffmpeg-exec.js";
 
 export type MediaProbeKind = Extract<MediaKind, "audio" | "video">;
@@ -24,6 +25,7 @@ export type PlaybackMediaProbeResult = MediaProbeResult & {
   videoPixelFormat?: string;
   videoProfile?: string;
   videoRotation?: number;
+  videoSampleAspectRatio?: number;
   videoStreamIndex?: number;
 };
 
@@ -53,18 +55,6 @@ function parseDurationMs(value: unknown): number | undefined {
     return undefined;
   }
   return parsePositiveInteger(Math.round(seconds * 1000));
-}
-
-function normalizeCodecName(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const normalized = value.trim().toLowerCase();
-  return normalized || undefined;
-}
-
-function parseStreamIndex(value: unknown): number | undefined {
-  return asSafeIntegerInRange(value, { min: 0 });
 }
 
 function selectPlaybackStream(
@@ -111,21 +101,29 @@ function parseFfprobeMediaMetadata(
     parseDurationMs(format?.duration);
   const width = parsePositiveInteger(videoStream?.width);
   const height = parsePositiveInteger(videoStream?.height);
+  const [sarWidth, sarHeight] =
+    typeof videoStream?.sample_aspect_ratio === "string"
+      ? videoStream.sample_aspect_ratio
+          .split(":")
+          .map((value) => parsePositiveInteger(Number(value)))
+      : [];
+  const videoSampleAspectRatio = sarWidth && sarHeight ? sarWidth / sarHeight : undefined;
   const videoRotation = (
     Array.isArray(videoStream?.side_data_list) ? videoStream.side_data_list : []
   )
     .map((sideData) => asSafeIntegerInRange(readRecord(sideData)?.rotation, {}))
     .find((rotation) => rotation !== undefined);
-  const audioCodec = normalizeCodecName(audioStream?.codec_name);
-  const videoCodec = normalizeCodecName(videoStream?.codec_name);
-  const videoPixelFormat = normalizeCodecName(videoStream?.pix_fmt);
-  const videoProfile = normalizeCodecName(videoStream?.profile);
-  const audioStreamIndex = parseStreamIndex(audioStream?.index);
-  const videoStreamIndex = parseStreamIndex(videoStream?.index);
+  const audioCodec = normalizeOptionalLowercaseString(audioStream?.codec_name);
+  const videoCodec = normalizeOptionalLowercaseString(videoStream?.codec_name);
+  const videoPixelFormat = normalizeOptionalLowercaseString(videoStream?.pix_fmt);
+  const videoProfile = normalizeOptionalLowercaseString(videoStream?.profile);
+  const audioStreamIndex = asSafeIntegerInRange(audioStream?.index, { min: 0 });
+  const videoStreamIndex = asSafeIntegerInRange(videoStream?.index, { min: 0 });
   return {
     ...(durationMs ? { durationMs } : {}),
     ...(kind === "video" && width && height ? { width, height } : {}),
     ...(videoRotation !== undefined ? { videoRotation } : {}),
+    ...(videoSampleAspectRatio !== undefined ? { videoSampleAspectRatio } : {}),
     ...(audioCodec ? { audioCodec } : {}),
     ...(audioStreamIndex !== undefined ? { audioStreamIndex } : {}),
     ...(videoCodec ? { videoCodec } : {}),
@@ -143,7 +141,7 @@ function buildFfprobeMetadataArgs(protocol: "fd" | "pipe"): string[] {
     "-protocol_whitelist",
     protocol,
     "-show_entries",
-    "format=duration:stream=index,codec_type,codec_name,profile,pix_fmt,duration,width,height:stream_disposition=default,attached_pic:stream_side_data=rotation",
+    "format=duration:stream=index,codec_type,codec_name,profile,pix_fmt,duration,width,height,sample_aspect_ratio:stream_disposition=default,attached_pic:stream_side_data=rotation",
     "-of",
     "json",
     ...(isFileDescriptor ? ["-fd", "0"] : []),
@@ -194,12 +192,17 @@ export function toMediaProbeResult(result: PlaybackMediaProbeResult | null): Med
     return {};
   }
   const swapsAxes = Math.abs(result.videoRotation ?? 0) % 180 === 90;
+  // Non-square pixels change display width before rotation; playback keeps encoded axes.
+  const width =
+    result.width &&
+    (parsePositiveInteger(Math.round(result.width * (result.videoSampleAspectRatio ?? 1))) ??
+      result.width);
   return {
     ...(result.durationMs ? { durationMs: result.durationMs } : {}),
-    ...(result.width && result.height
+    ...(width && result.height
       ? {
-          width: swapsAxes ? result.height : result.width,
-          height: swapsAxes ? result.width : result.height,
+          width: swapsAxes ? result.height : width,
+          height: swapsAxes ? width : result.height,
         }
       : {}),
   };
@@ -259,7 +262,6 @@ export async function probePlaybackMediaFileDescriptor(
   return await probeMediaSource({ kind: "fileDescriptor", fd }, kind, options);
 }
 
-/** Positive display dimensions of the selected video stream. */
 type VideoDimensions = {
   width: number;
   height: number;

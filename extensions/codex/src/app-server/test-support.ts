@@ -10,7 +10,11 @@ import { expect, vi } from "vitest";
 import { resolveCodexAppServerHomeDir } from "./auth-start-options.js";
 import { CodexAppServerClient } from "./client.js";
 import { resolveCodexAppServerRuntimeOptions } from "./config.js";
-import { isJsonObject } from "./protocol.js";
+import {
+  isJsonObject,
+  type CodexConfigReadResponse,
+  type CodexGetAccountResponse,
+} from "./protocol.js";
 import {
   getLeasedSharedCodexAppServerClient,
   releaseLeasedSharedCodexAppServerClient,
@@ -93,6 +97,20 @@ export function adaptCodexTestClientFactory(
     );
 }
 
+export function createCodexTestOAuthProfile(accountId: string) {
+  const payload = Buffer.from(
+    JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
+  ).toString("base64url");
+  return {
+    type: "oauth" as const,
+    provider: "openai",
+    access: `e30.${payload}.test-signature`,
+    refresh: "synthetic-refresh-token",
+    expires: Date.now() + 60_000,
+    accountId,
+  };
+}
+
 /** Builds a representative Codex-capable model fixture for app-server tests. */
 export function createCodexTestModel(provider = "openai", input = ["text"]): Model {
   return {
@@ -145,6 +163,7 @@ export function createClientHarness(
   options: {
     autoEmitExit?: boolean;
     maxFrameBytes?: number;
+    onWriteCallback?: (callback: (error?: Error | null) => void) => void;
     onWrite?: (line: string, send: (message: unknown) => void) => void;
   } = {},
 ) {
@@ -172,7 +191,11 @@ export function createClientHarness(
   const stdin = new Writable({
     write(chunk, _encoding, callback) {
       writes.push(chunk.toString());
-      callback();
+      if (options.onWriteCallback) {
+        options.onWriteCallback(callback);
+      } else {
+        callback();
+      }
       writeEvents.emit("write");
       options.onWrite?.(chunk.toString(), (message) =>
         stdout.write(`${JSON.stringify(message)}\n`),
@@ -255,6 +278,39 @@ export function createClientHarness(
       stdout.write(`${JSON.stringify(message)}\n`);
     },
   };
+}
+
+/** Stock read-only replies from an authenticated managed native app-server. */
+export function createCodexInferenceReadResponses() {
+  return {
+    "config/read": { config: {}, origins: {}, layers: [] },
+    "account/read": { account: { type: "apiKey" }, requiresOpenaiAuth: true },
+  } satisfies {
+    "config/read": CodexConfigReadResponse;
+    "account/read": CodexGetAccountResponse;
+  };
+}
+
+/** Keep other RPCs manual; low-level protocol tests still use the raw harness. */
+export function createInferenceReadyClientHarness(
+  options: NonNullable<Parameters<typeof createClientHarness>[0]> = {},
+) {
+  const reads = createCodexInferenceReadResponses();
+  return createClientHarness({
+    ...options,
+    onWrite: (line, send) => {
+      const request: unknown = JSON.parse(line);
+      if (
+        isJsonObject(request) &&
+        request.id !== undefined &&
+        (request.method === "config/read" || request.method === "account/read")
+      ) {
+        send({ id: request.id, result: reads[request.method] });
+      } else {
+        options.onWrite?.(line, send);
+      }
+    },
+  });
 }
 
 /** External transport replies with a real initialize handshake and shared-client lease. */

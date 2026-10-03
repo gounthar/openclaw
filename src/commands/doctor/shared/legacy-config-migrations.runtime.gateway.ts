@@ -1,4 +1,4 @@
-// Legacy gateway runtime config migrations for bind modes, WebChat, and Control UI origins.
+// Legacy gateway runtime config migrations for bind modes and Control UI origins.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import {
   buildDefaultControlUiAllowedOrigins,
@@ -25,13 +25,8 @@ const GATEWAY_BIND_RULE: LegacyConfigRule = {
   path: ["gateway", "bind"],
   message:
     'gateway.bind host aliases (for example 0.0.0.0/localhost) are legacy; use bind modes (lan/loopback/custom/tailnet/auto) instead. Run "openclaw doctor --fix".',
-  match: (value) => isLegacyGatewayBindHostAlias(value),
+  match: (value) => normalizeLegacyGatewayBindHostAlias(value) !== null,
   requireSourceLiteral: true,
-};
-
-const GATEWAY_WEBCHAT_RULE: LegacyConfigRule = {
-  path: ["gateway", "webchat"],
-  message: 'gateway.webchat is retired. Run "openclaw doctor --fix".',
 };
 
 const GATEWAY_TAILSCALE_RESET_ON_EXIT_RULE: LegacyConfigRule = {
@@ -70,10 +65,6 @@ const LEGACY_GATEWAY_BIND_HOST_ALIASES = new Map<string, "lan" | "loopback">([
   ["::1", "loopback"],
   ["[::1]", "loopback"],
 ]);
-
-function isLegacyGatewayBindHostAlias(value: unknown): boolean {
-  return normalizeLegacyGatewayBindHostAlias(value) !== null;
-}
 
 function normalizeLegacyGatewayBindHostAlias(value: unknown): "lan" | "loopback" | null {
   const normalized = normalizeOptionalLowercaseString(value);
@@ -116,8 +107,6 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
       if (wasManagedService) {
         tailscale.mode = "off";
       }
-      gateway.tailscale = tailscale;
-      raw.gateway = gateway;
       changes.push(
         wasManagedService
           ? "Removed gateway.tailscale.serviceName and set gateway.tailscale.mode=off because named Services cannot use lifecycle-owned routes. " +
@@ -138,8 +127,6 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
       }
       const cleanupWasEnabled = tailscale.resetOnExit === true;
       delete tailscale.resetOnExit;
-      gateway.tailscale = tailscale;
-      raw.gateway = gateway;
       changes.push(
         cleanupWasEnabled
           ? "Removed gateway.tailscale.resetOnExit; managed Tailscale routes now end automatically with the Gateway lifecycle."
@@ -162,24 +149,6 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
     },
   }),
   defineLegacyConfigMigration({
-    id: "gateway.webchat-remove",
-    describe: "Remove retired WebChat gateway config",
-    legacyRules: [GATEWAY_WEBCHAT_RULE],
-    apply: (raw, changes) => {
-      const gateway = getRecord(raw.gateway);
-      if (!gateway || !Object.hasOwn(gateway, "webchat")) {
-        return;
-      }
-      delete gateway.webchat;
-      if (Object.keys(gateway).length > 0) {
-        raw.gateway = gateway;
-      } else {
-        delete raw.gateway;
-      }
-      changes.push("Removed retired gateway.webchat config.");
-    },
-  }),
-  defineLegacyConfigMigration({
     id: "gateway.port-oob-repair",
     describe: "Remove out-of-range gateway.port to avoid post-schema-tightening startup failures",
     legacyRules: [GATEWAY_PORT_OOB_RULE],
@@ -193,9 +162,7 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
         return;
       }
       delete gateway.port;
-      if (Object.keys(gateway).length > 0) {
-        raw.gateway = gateway;
-      } else {
+      if (Object.keys(gateway).length === 0) {
         delete raw.gateway;
       }
       changes.push(
@@ -220,6 +187,7 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
       if (
         hasConfiguredControlUiAllowedOrigins({
           allowedOrigins: controlUi.allowedOrigins,
+          publicOrigin: gateway.publicOrigin,
           dangerouslyAllowHostHeaderOriginFallback:
             controlUi.dangerouslyAllowHostHeaderOriginFallback,
         })
@@ -234,7 +202,6 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
           typeof gateway.customBindHost === "string" ? gateway.customBindHost : undefined,
       });
       gateway.controlUi = { ...controlUi, allowedOrigins: origins };
-      raw.gateway = gateway;
       changes.push(
         `Seeded gateway.controlUi.allowedOrigins ${JSON.stringify(origins)} for bind=${bind}. ` +
           "Required since v2026.2.26. Add other machine origins to gateway.controlUi.allowedOrigins if needed.",
@@ -255,18 +222,12 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_GATEWAY: LegacyConfigMigrationSpec
         return;
       }
 
-      const normalized = normalizeOptionalLowercaseString(bindRaw);
-      if (!normalized) {
-        return;
-      }
       const mapped = normalizeLegacyGatewayBindHostAlias(bindRaw);
-
-      if (!mapped || normalized === mapped) {
+      if (!mapped) {
         return;
       }
 
       gateway.bind = mapped;
-      raw.gateway = gateway;
       changes.push(`Normalized gateway.bind "${escapeControlForLog(bindRaw)}" → "${mapped}".`);
     },
   }),

@@ -4,10 +4,14 @@ import {
   loadSessionEntryReadOnly,
   patchSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
+import { observeSessionMaintenanceChanges } from "../config/sessions/session-accessor.sqlite-maintenance.test-support.js";
+import * as reclamationRun from "../config/sessions/session-accessor.sqlite-reclamation-run.js";
 import { collectSessionMaintenancePreserveKeys } from "../config/sessions/store-maintenance-preserve.js";
 import { resolveMaintenanceConfigFromInput } from "../config/sessions/store-maintenance.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.js";
 import { getSessionRepositoryWorkspaceStore } from "../state/session-repository-workspaces.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import * as workspaceRetention from "./worker-environments/node-workspace-retain-coordinator.js";
 import type { WorkerSessionPlacementRecord } from "./worker-environments/placement-record.js";
@@ -37,6 +41,7 @@ vi.mock("./worker-environments/placement-disk-space.js", async (importOriginal) 
   createWorkerPlacementDiskSpaceMonitor: runtimeFactoryMocks.createDiskSpace,
 }));
 
+import { getRuntimeConfig } from "../config/config.js";
 import { createGatewayWorkerPlacementRuntime } from "./server-worker-placement-startup.js";
 
 type PlacementFixture = {
@@ -97,31 +102,44 @@ function createMaintenanceRuntime(params: {
       goneEnvironmentIds.has(environmentId)
         ? { state: "destroyed" as const, leaseId: null }
         : { state: "attached" as const, leaseId: "cloud-lease" },
+    subscribeMachineShapeChanged: vi.fn(() => vi.fn()),
     installReconcileEnvironmentGuard: vi.fn(() => vi.fn()),
     start: vi.fn(),
     stop,
   };
   const runtime = createGatewayWorkerPlacementRuntime({
+    scheduler: createTestGatewayScheduler(),
+    getCommittedRuntimeConfig: getRuntimeConfig,
     cancelSessionWork: vi.fn(async () => {}),
     placements: {
       workspaceResultInstanceId: () => "gateway-test",
       get: (sessionId: string) =>
         params.placements.find((placement) => placement.sessionId === sessionId),
       list: () => params.placements,
-      listForReconcile: () =>
+      listForReconcile: (sessionKey?: string) =>
         params.placements.filter(
-          (placement) => placement.state !== "local" && placement.state !== "reclaimed",
+          (placement) =>
+            placement.state !== "local" &&
+            placement.state !== "reclaimed" &&
+            (sessionKey === undefined || placement.sessionKey === sessionKey),
         ),
       retireSessionPlacement: vi.fn(),
-      pruneOrphanedWorkspaceReconciliations: () => {
+      pruneOrphanedWorkspaceReconciliations: async () => {
         params.onRecovery?.();
         if (params.recoveryError) {
           throw params.recoveryError;
         }
         return [];
       },
-      listWorkspaceReconciliationOwners: () => [],
-      listPendingWorkspaceResults: () => [],
+      listWorkspaceReconciliationOwners: async () => [],
+      listPendingWorkspaceResultsAsync: async () => [],
+      prepareRuntimeRefresh: async (sessionId: string) => ({
+        placement: params.placements.find((placement) => placement.sessionId === sessionId),
+        move: undefined,
+        pendingResult: undefined,
+        assertCurrent: () => {},
+        release: () => {},
+      }),
     } as never,
     environments: environments as never,
     gatewayNamespace: "gateway-test",
@@ -155,13 +173,13 @@ describe("worker placement session maintenance ownership", () => {
         workspaceBaseManifestRef: `sha256:${"a".repeat(64)}`,
       };
       const repositories = getSessionRepositoryWorkspaceStore();
-      const repository = repositories.create({
+      const repository = await repositories.create({
         agentId: placement.agentId,
         sessionKey: placement.sessionKey,
         url: "https://github.com/openclaw/fixture.git",
         assertCurrent: () => {},
       });
-      repositories.bindBase({
+      await repositories.bindBase({
         workspaceId: repository.workspaceId,
         expectedRevision: repository.revision,
         baseCommit: "c".repeat(40),
@@ -189,7 +207,8 @@ describe("worker placement session maintenance ownership", () => {
         }
         const originalManifest = placement.workspaceBaseManifestRef;
         placement.workspaceBaseManifestRef = `sha256:${"b".repeat(64)}`;
-        expect(additionalManifestRefs(currentPlacement)).toEqual([originalManifest]);
+        const currentManifestRefs = await additionalManifestRefs(currentPlacement);
+        expect(currentManifestRefs()).toEqual([originalManifest]);
       } finally {
         createRetention.mockRestore();
       }
@@ -201,7 +220,7 @@ describe("worker placement session maintenance ownership", () => {
     { maintenance: "stale pruning", sessionKey: "agent:main:explicit:cloud-owned-prune" },
     { maintenance: "entry capping", sessionKey: "agent:main:explicit:cloud-owned-cap" },
   ] as const)(
-    "preserves active placements during write-triggered $maintenance and releases them on stop",
+    "preserves active placements during $maintenance and releases them for maintenance after stop",
     async ({ maintenance, sessionKey }) => {
       await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
         const now = Date.now();
@@ -252,13 +271,30 @@ describe("worker placement session maintenance ownership", () => {
           await patchSessionEntryCore(
             sessionScope("agent:main:explicit:maintenance-trigger"),
             () => triggerEntry,
-            { fallbackEntry: triggerEntry, maintenanceConfig },
+            { fallbackEntry: triggerEntry, replaceEntry: true, maintenanceConfig },
           );
+        const agePublished = createDeferredCore();
+        const reclaim = reclamationRun.runSqliteSessionReclamation;
+        const ageObserver = vi
+          .spyOn(reclamationRun, "runSqliteSessionReclamation")
+          .mockImplementation(async (params) => {
+            const result = await reclaim(params);
+            if (params.plan.kind === "maintenance-age" && params.plan.expected === undefined) {
+              agePublished.resolve();
+            }
+            return result;
+          });
 
         try {
+          const sentinelArchived = observeSessionMaintenanceChanges(storePath, sentinelKey);
           await triggerMaintenance();
+          await sentinelArchived;
+          await agePublished.promise;
           await vi.waitFor(() => {
-            expect(loadSessionEntry(sessionScope(sentinelKey))).toBeUndefined();
+            expect(loadSessionEntry(sessionScope(sentinelKey))).toMatchObject({
+              sessionId: sentinelEntry.sessionId,
+              archivedAt: expect.any(Number),
+            });
           });
           expect(loadSessionEntry(sessionScope(sessionKey))).toMatchObject({
             sessionId: placement.sessionId,
@@ -269,19 +305,19 @@ describe("worker placement session maintenance ownership", () => {
 
           await sidecar.stop();
           expect(collectSessionMaintenancePreserveKeys()?.has(sessionKey)).not.toBe(true);
+          // A managed backdate invalidates the age fact held by the native worker.
+          triggerEntry.updatedAt -= 1;
+          const placementArchived = observeSessionMaintenanceChanges(storePath, sessionKey);
           await triggerMaintenance();
-          if (maintenance === "dashboard archive" || maintenance === "entry capping") {
-            await vi.waitFor(() => {
-              expect(loadSessionEntry(sessionScope(sessionKey))?.archivedAt).toEqual(
-                expect.any(Number),
-              );
+          await placementArchived;
+          await vi.waitFor(() => {
+            expect(loadSessionEntry(sessionScope(sessionKey))).toMatchObject({
+              sessionId: placement.sessionId,
+              archivedAt: expect.any(Number),
             });
-          } else {
-            await vi.waitFor(() => {
-              expect(loadSessionEntry(sessionScope(sessionKey))).toBeUndefined();
-            });
-          }
+          });
         } finally {
+          ageObserver.mockRestore();
           await sidecar.stop();
         }
       });

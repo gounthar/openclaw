@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 set -euo pipefail
 
 SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,18 +37,6 @@ DOCKER_CACHE_CONTAINER_DIR="/tmp/openclaw-cache"
 DOCKER_CLI_TOOLS_CONTAINER_DIR="/tmp/openclaw-npm-global"
 DOCKER_EXTRA_ENV_FILES=()
 DOCKER_AUTH_PRESTAGED=0
-
-openclaw_live_codex_harness_append_build_extension() {
-  local extension="${1:?extension required}"
-  local current="${OPENCLAW_DOCKER_BUILD_EXTENSIONS:-${OPENCLAW_EXTENSIONS:-}}"
-  case " $current " in
-    *" $extension "*)
-      ;;
-    *)
-      export OPENCLAW_DOCKER_BUILD_EXTENSIONS="${current:+$current }$extension"
-      ;;
-  esac
-}
 
 case "$CODEX_HARNESS_AUTH_MODE" in
   codex-auth | api-key)
@@ -252,7 +244,7 @@ else
 fi
 EOF
 
-openclaw_live_codex_harness_append_build_extension codex
+openclaw_live_require_build_extension codex
 # The release package image intentionally excludes externalized plugins such as
 # Codex. This lane must rebuild the live image so the plugin-owned harness is
 # present under the bundled plugin runtime directory.

@@ -8,11 +8,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildWidgetDocument } from "../../../src/canvas/wrap.js";
 import { buildBoardWidgetSandboxPath } from "../../../src/gateway/board-sandbox.js";
 import { createSandboxHostHttpServer } from "../../../src/gateway/mcp-app-sandbox-http.js";
-import { getGatewayE2ePortBlock } from "../../../src/gateway/test-helpers.e2e.js";
+import { acquireGatewayE2ePortBlock } from "../../../src/gateway/test-helpers.listener.js";
+import type { TestPortClaim } from "../../../src/test-utils/port-claims.js";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
+import { clickBoardWidgetControl } from "../test-helpers/control-ui-e2e-widget.ts";
 import {
   canRunPlaywrightChromium,
-  clickBoardWidgetControl,
   controlUiBundledSettingsStorageKey,
   controlUiSessionUrl,
   installMockGateway,
@@ -20,6 +21,7 @@ import {
   startControlUiE2eServer,
   type ControlUiE2eServer,
 } from "../test-helpers/control-ui-e2e.ts";
+import { installA2uiFailureDiagnostics } from "./board-a2ui.test-support.ts";
 
 const chromiumExecutablePath = resolvePlaywrightChromiumExecutablePath(chromium.executablePath());
 const chromiumAvailable = canRunPlaywrightChromium(chromiumExecutablePath);
@@ -33,6 +35,7 @@ let browser: Browser;
 let controlUi: ControlUiE2eServer;
 let sandboxServer: HttpServer;
 let sandboxPort: number;
+let sandboxPortClaim: TestPortClaim | undefined;
 let rendererServer: HttpServer;
 let rendererOrigin: string;
 let rendererBundle: Buffer;
@@ -82,7 +85,8 @@ describeControlUiE2e("Control UI dashboard A2UI", () => {
     }
     rendererOrigin = `http://127.0.0.1:${rendererAddress.port}`;
     controlUi = await startControlUiE2eServer();
-    sandboxPort = await getGatewayE2ePortBlock();
+    sandboxPortClaim = await acquireGatewayE2ePortBlock();
+    sandboxPort = sandboxPortClaim.port;
     sandboxServer = createSandboxHostHttpServer();
     await new Promise<void>((resolve) => {
       sandboxServer.listen(sandboxPort, "127.0.0.1", resolve);
@@ -103,6 +107,7 @@ describeControlUiE2e("Control UI dashboard A2UI", () => {
         sandboxServer.close(() => resolve());
       });
     }
+    await sandboxPortClaim?.release();
     if (rendererServer) {
       await new Promise<void>((resolve) => {
         rendererServer.close(() => resolve());
@@ -111,8 +116,67 @@ describeControlUiE2e("Control UI dashboard A2UI", () => {
     await controlUi?.close();
   });
 
-  for (const colorScheme of ["dark", "light"] as const) {
-    it(`renders a v0.9 widget with the ${colorScheme} scrollbar theme`, async () => {
+  it("sends each v0.8 action once after the host reconnects", async () => {
+    const context = await browser.newContext();
+    contexts.add(context);
+    const page = await context.newPage();
+    await page.addScriptTag({
+      path: path.resolve("extensions/canvas/src/host/a2ui/a2ui.bundle.js"),
+      type: "module",
+    });
+    const result = await page.evaluate(async () => {
+      await customElements.whenDefined("openclaw-a2ui-host");
+      const emitted: unknown[] = [];
+      Reflect.set(globalThis, "openclaw", {
+        state: {
+          emit(payload: unknown) {
+            emitted.push(payload);
+            return Promise.resolve();
+          },
+        },
+      });
+      const host = document.createElement("openclaw-a2ui-host");
+      const sendAction = () =>
+        host.dispatchEvent(
+          new CustomEvent("a2uiaction", {
+            detail: {
+              eventType: "a2ui.action",
+              sourceComponentId: "refresh-button",
+              action: { name: "refresh" },
+            },
+          }),
+        );
+      document.body.append(host);
+      sendAction();
+      const connectedCount = emitted.length;
+      emitted.length = 0;
+      host.remove();
+      document.body.append(host);
+      sendAction();
+      host.remove();
+      return { connectedCount, reconnected: emitted };
+    });
+    expect(result.connectedCount).toBe(1);
+    expect(result.reconnected).toHaveLength(1);
+    expect(result.reconnected[0]).toMatchObject({
+      eventType: "a2ui.action",
+      action: { name: "refresh", surfaceId: "main", sourceComponentId: "refresh-button" },
+    });
+  });
+
+  for (const { colorScheme, rejectsAction, name } of [
+    ...(["dark", "light"] as const).map((theme) => ({
+      colorScheme: theme,
+      rejectsAction: false,
+      name: `renders a v0.9 widget with the ${theme} scrollbar theme`,
+    })),
+    {
+      colorScheme: "light" as const,
+      rejectsAction: true,
+      name: "shows rejected v0.9 actions and clears the widget on reset",
+    },
+  ]) {
+    it(name, async ({ onTestFailed }) => {
       const context = await browser.newContext({
         colorScheme,
         permissions: ["local-network-access"],
@@ -121,7 +185,27 @@ describeControlUiE2e("Control UI dashboard A2UI", () => {
       contexts.add(context);
       const page = await context.newPage();
       const pageErrors: string[] = [];
-      page.on("pageerror", (error) => pageErrors.push(error.message));
+      let pageErrorCount = 0;
+      page.on("pageerror", (error) => {
+        pageErrorCount += 1;
+        if (pageErrors.length < 8) {
+          pageErrors.push(error.message.slice(0, 512));
+        }
+      });
+      const diagnostics = await installA2uiFailureDiagnostics(page);
+      let actionStage = "opening dashboard";
+      onTestFailed(async () => {
+        console.error(
+          "[board-a2ui] action diagnostics",
+          JSON.stringify({
+            colorScheme,
+            actionStage,
+            pageErrorCount,
+            pageErrors,
+            ...(await diagnostics.snapshot()),
+          }),
+        );
+      });
       const origin = new URL(controlUi.baseUrl).origin;
       const rendererUrl = `${rendererOrigin}/__openclaw__/cap/canvas-proof/__openclaw__/a2ui/a2ui-v0.9.bundle.js`;
       const messages = [
@@ -223,13 +307,61 @@ describeControlUiE2e("Control UI dashboard A2UI", () => {
         )
         .toBe(true);
       const widgetFrame = outerFrame!.childFrames()[0]!;
+      diagnostics.target(widgetFrame);
       await widgetFrame.getByText("A2UI board widget").waitFor();
       await expect
         .poll(() => outer.evaluate((element) => getComputedStyle(element).opacity))
         .toBe("1");
       expect(await outer.getAttribute("inert")).toBeNull();
+      if (rejectsAction) {
+        actionStage = "installing oversized action";
+        await widgetFrame.evaluate(() => {
+          Reflect.get(globalThis, "openclawA2UI").applyMessages([
+            {
+              version: "v0.9",
+              updateComponents: {
+                surfaceId: "main",
+                components: [
+                  {
+                    id: "action",
+                    component: "Button",
+                    child: "action-label",
+                    variant: "primary",
+                    action: {
+                      event: { name: "refresh", context: { diagnostic: "x".repeat(8193) } },
+                    },
+                  },
+                ],
+              },
+            },
+          ]);
+        });
+        actionStage = "clicking oversized action";
+        await clickBoardWidgetControl(page, widgetFrame.getByText("Refresh data"));
+        actionStage = "waiting for rejected-action alert";
+        await expect
+          .poll(() => widgetFrame.getByRole("alert").allTextContents())
+          .toEqual(["widget state payload exceeds 8192 UTF-8 bytes"]);
+        expect(await widgetFrame.getByRole("alert").isVisible()).toBe(true);
+        expect(await gateway.getRequests("board.event")).toHaveLength(0);
+        expect(pageErrors).toEqual([]);
+
+        actionStage = "resetting renderer after rejection";
+        await widgetFrame.evaluate(() => Reflect.get(globalThis, "openclawA2UI").reset());
+        await expect.poll(() => widgetFrame.getByRole("alert").count()).toBe(0);
+        await expect.poll(() => widgetFrame.locator("a2ui-surface").count()).toBe(0);
+        await widgetFrame.evaluate(
+          (initialMessages) =>
+            Reflect.get(globalThis, "openclawA2UI").applyMessages(initialMessages),
+          messages,
+        );
+        await widgetFrame.getByText("A2UI board widget").waitFor();
+      }
+      actionStage = "waiting for native pointer entry and clicking refresh";
       await clickBoardWidgetControl(page, widgetFrame.getByText("Refresh data"));
+      actionStage = "waiting for board.event";
       await expect.poll(async () => (await gateway.getRequests("board.event")).length).toBe(1);
+      actionStage = "validating delivered action and scrollbar";
       expect((await gateway.getRequests("board.event"))[0]?.params).toMatchObject({
         ticket: "ticket",
         payload: {
@@ -237,6 +369,11 @@ describeControlUiE2e("Control UI dashboard A2UI", () => {
           action: { name: "refresh", surfaceId: "main", sourceComponentId: "action" },
         },
       });
+      if (rejectsAction) {
+        expect(await widgetFrame.getByRole("alert").count()).toBe(0);
+        expect(pageErrors).toEqual([]);
+        return;
+      }
       await page.mouse.move(40, 40);
 
       const scrollbar = await widgetFrame.evaluate(() => {

@@ -16,7 +16,7 @@ final class StatusMenuSummaries: NSObject {
         let revision: UInt64?
         var lease: GatewayConnection.ServerLease?
         var usage: GatewayUsageSummary?
-        var cost: GatewayCostUsageSummary?
+        var cost: (summary: GatewayCostUsageSummary, dates: CostUsageMenuDateParser)?
         var costError: String?
         var usageUpdatedAt: Date?
         var costUpdatedAt: Date?
@@ -56,7 +56,7 @@ final class StatusMenuSummaries: NSObject {
         self.currentUsageState?.usage
     }
 
-    private var cachedCost: GatewayCostUsageSummary? {
+    private var cachedCost: (summary: GatewayCostUsageSummary, dates: CostUsageMenuDateParser)? {
         self.currentUsageState?.cost
     }
 
@@ -214,14 +214,15 @@ final class StatusMenuSummaries: NSObject {
             entries.append(.info(id: "usage.loading", title: String(localized: "Loading usage…")))
         }
 
-        if let summary = self.cachedCost, !summary.daily.isEmpty {
+        if let cost = self.cachedCost, !cost.summary.daily.isEmpty {
             if !entries.isEmpty {
                 entries.append(.separator(id: "usage.cost.separator"))
             }
             entries.append(MenuEntry(id: "usage.cost.chart") { item in
                 item.title = String(localized: "Usage cost (30 days)")
                 item.isEnabled = false
-                StatusMenuRenderer.configureHostedView(item, rootView: CostUsageHistoryMenuView(summary: summary))
+                StatusMenuRenderer.configureHostedView(
+                    item, rootView: CostUsageHistoryMenuView(summary: cost.summary, dates: cost.dates))
             })
         } else if let error = self.costError {
             if !entries.isEmpty {
@@ -244,10 +245,7 @@ final class StatusMenuSummaries: NSObject {
                 detail: String(format: String(localized: "%lld connected"), count)),
             highlights: true)
 
-        var entries: [MenuEntry] = []
-        if let gateway = self.gatewayEntry() {
-            entries.append(self.nodeEntry(gateway))
-        }
+        var entries = [self.nodeEntry(self.gatewayEntry())]
         if let notice = self.nodes.persistentServiceNotice {
             entries.append(.info(id: "devices.service.notice", title: notice))
         }
@@ -417,10 +415,12 @@ final class StatusMenuSummaries: NSObject {
     private func loadCost(_ refresh: Refresh, enabled: Bool) async {
         guard enabled, self.isCurrent(refresh), let lease = refresh.lease else { return }
         do {
+            let dates = CostUsageMenuDateParser(timeZone: .current)
             let data = try await self.control.request(
-                method: "usage.cost", timeoutMs: 7000, ifCurrentServerLease: lease)
+                method: "usage.cost", params: dates.requestParameters, timeoutMs: 7000, ifCurrentServerLease: lease)
             guard self.isCurrent(refresh) else { return }
-            self.usageState?.cost = try JSONDecoder().decode(GatewayCostUsageSummary.self, from: data)
+            // Cached buckets retain the request's day boundaries if the Mac changes time zones.
+            self.usageState?.cost = try (JSONDecoder().decode(GatewayCostUsageSummary.self, from: data), dates)
             self.usageState?.costError = nil
             self.usageState?.costUpdatedAt = Date()
         } catch {
@@ -452,13 +452,13 @@ final class StatusMenuSummaries: NSObject {
 
     @objc
     private func openAutomations(_: NSMenuItem) {
-        Task { await DashboardManager.shared.show(atPath: DashboardRouteMap.cronJobsPagePath) }
+        AppNavigationActions.openPrimaryWebRoute(DashboardRouteMap.cronJobsPagePath)
     }
 
     @objc
     private func openGateway(_ sender: NSMenuItem) {
         guard let id = sender.identifier?.rawValue, let target = DashboardGatewayTarget(bridgeID: id) else { return }
-        DashboardManager.shared.openOrFocusDashboard(for: target)
+        AppNavigationActions.openGateway(target)
     }
 
     @objc
@@ -492,7 +492,7 @@ extension StatusMenuSummaries {
         }
     }
 
-    private func gatewayEntry() -> NodeInfo? {
+    private func gatewayEntry() -> NodeInfo {
         let mode = AppStateStore.shared.connectionMode
         var host: String?
         let platform: String?
@@ -556,25 +556,16 @@ extension StatusMenuSummaries {
     }
 
     private func configureNodeSubmenu(for item: NSMenuItem, node: NodeInfo) {
-        var entries = [self.copyEntry(node: node, id: "id", label: String(localized: "Node ID"), value: node.nodeId)]
-        if let name = node.displayName?.nonEmpty {
-            entries.append(self.copyEntry(node: node, id: "name", label: String(localized: "Name"), value: name))
-        }
-        if let ip = node.remoteIp?.nonEmpty {
-            entries.append(self.copyEntry(node: node, id: "ip", label: String(localized: "IP"), value: ip))
-        }
-        entries.append(self.copyEntry(
-            node: node,
-            id: "status",
-            label: String(localized: "Status"),
-            value: NodeMenuEntryFormatter.roleText(node)))
-        if let platform = NodeMenuEntryFormatter.platformText(node) {
-            entries.append(self.copyEntry(
-                node: node, id: "platform", label: String(localized: "Platform"), value: platform))
-        }
-        if let version = NodeMenuEntryFormatter.detailRightVersion(node)?.nonEmpty {
-            entries.append(self.copyEntry(
-                node: node, id: "version", label: String(localized: "Version"), value: version))
+        let fields: [(id: String, label: String, value: String?)] = [
+            ("id", String(localized: "Node ID"), node.nodeId),
+            ("name", String(localized: "Name"), node.displayName?.nonEmpty),
+            ("ip", String(localized: "IP"), node.remoteIp?.nonEmpty),
+            ("status", String(localized: "Status"), NodeMenuEntryFormatter.roleText(node)),
+            ("platform", String(localized: "Platform"), NodeMenuEntryFormatter.platformText(node)),
+            ("version", String(localized: "Version"), NodeMenuEntryFormatter.detailRightVersion(node)?.nonEmpty),
+        ]
+        var entries = fields.compactMap { field in
+            field.value.map { self.copyEntry(node: node, id: field.id, label: field.label, value: $0) }
         }
         entries.append(.info(
             id: "devices.node.\(node.nodeId).connected",

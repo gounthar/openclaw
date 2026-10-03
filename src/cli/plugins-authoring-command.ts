@@ -1,8 +1,11 @@
-// Plugin authoring commands for init/build/validate manifest generation.
 import fs from "node:fs";
 import path from "node:path";
+import { replaceFileAtomic } from "@openclaw/fs-safe/atomic";
 import { jsonSchemaValuesEqual } from "@openclaw/normalization-core/json-schema";
-import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import {
+  filterStringEntries,
+  uniqueStrings,
+} from "@openclaw/normalization-core/string-normalization";
 import { formatCwdRelativePathOrAbsolute as formatOutputPath } from "../infra/safe-cwd.js";
 import { getToolPluginMetadata, type ToolPluginMetadata } from "../plugin-sdk/tool-plugin.js";
 import {
@@ -18,8 +21,10 @@ import { defaultRuntime } from "../runtime.js";
 import { toSafeImportPath } from "../shared/import-specifier.js";
 import { isRecord, shortenHomeInString } from "../utils.js";
 import { VERSION } from "../version.js";
+import { formatCliOperatorError } from "./failure-output.js";
 import { buildPluginControlUi, writePluginBuildManifest } from "./plugins-control-ui-build.js";
 import { writeFeaturePluginScaffold } from "./plugins-feature-scaffold.js";
+import { buildScaffoldTsconfig, type PluginScaffoldType } from "./plugins-scaffold-config.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -45,8 +50,6 @@ export type PluginsInitOptions = {
   name?: string;
   type?: string;
 };
-
-type PluginScaffoldType = "tool" | "provider" | "feature";
 
 type LoadedToolPlugin = {
   entry: unknown;
@@ -74,10 +77,6 @@ function writeJsonFile(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function jsStringLiteral(value: string): string {
-  return JSON.stringify(value);
-}
-
 function normalizeRelativePath(rootDir: string, targetPath: string): string {
   const relative = path
     .relative(rootDir, path.resolve(rootDir, targetPath))
@@ -86,10 +85,6 @@ function normalizeRelativePath(rootDir: string, targetPath: string): string {
     throw new Error(`entry must stay inside plugin root: ${targetPath}`);
   }
   return relative.startsWith(".") ? relative : `./${relative}`;
-}
-
-function resolveRootDir(input: string | undefined): string {
-  return path.resolve(input ?? process.cwd());
 }
 
 function resolveEntryPath(rootDir: string, entry: string | undefined): string {
@@ -114,10 +109,9 @@ function readPackageManifest(rootDir: string): JsonObject {
   return readJsonFile(packagePath);
 }
 
-async function importToolPluginEntry(entryPath: string, rootDir: string): Promise<unknown> {
+async function importToolPluginEntry(entryPath: string): Promise<unknown> {
   const loader = getCachedPluginModuleLoader({
     modulePath: entryPath,
-    rootDir,
     importerUrl: import.meta.url,
     loaderFilename: entryPath,
     aliasMap: buildPluginLoaderAliasMap(entryPath, process.argv[1], import.meta.url),
@@ -143,7 +137,7 @@ export async function loadToolPlugin(params: {
       `plugin entry not found: ${normalizeRelativePath(params.rootDir, params.entryPath)}`,
     );
   }
-  const entry = await importToolPluginEntry(params.entryPath, params.rootDir);
+  const entry = await importToolPluginEntry(params.entryPath);
   const metadata = getToolPluginMetadata(entry);
   if (!metadata) {
     throw new Error(
@@ -216,15 +210,8 @@ export function buildToolPluginPackageManifest(params: {
   packageManifest: JsonObject;
   entry: string;
 }): JsonObject {
-  const openclaw =
-    params.packageManifest.openclaw &&
-    typeof params.packageManifest.openclaw === "object" &&
-    !Array.isArray(params.packageManifest.openclaw)
-      ? { ...(params.packageManifest.openclaw as JsonObject) }
-      : {};
-  const existingExtensions = Array.isArray(openclaw.extensions)
-    ? openclaw.extensions.filter((entry): entry is string => typeof entry === "string")
-    : [];
+  const openclaw = isRecord(params.packageManifest.openclaw) ? params.packageManifest.openclaw : {};
+  const existingExtensions = filterStringEntries(openclaw.extensions);
   const extensions = uniqueStrings([...existingExtensions, params.entry]);
   return {
     ...params.packageManifest,
@@ -259,9 +246,7 @@ export function validateToolPluginProject(params: {
     errors.push("openclaw.plugin.json must include object configSchema");
   }
   const manifestContracts = params.manifest.contracts as { tools?: unknown } | undefined;
-  const manifestTools = Array.isArray(manifestContracts?.tools)
-    ? manifestContracts.tools.filter((tool): tool is string => typeof tool === "string")
-    : [];
+  const manifestTools = filterStringEntries(manifestContracts?.tools);
   const metadataTools = params.metadata.tools.map((tool) => tool.name);
   const missing = metadataTools.filter((tool) => !manifestTools.includes(tool));
   const extra = manifestTools.filter((tool) => !metadataTools.includes(tool));
@@ -289,7 +274,7 @@ export function validateToolPluginProject(params: {
 }
 
 export async function runPluginsBuildCommand(opts: PluginsBuildOptions): Promise<void> {
-  const rootDir = resolveRootDir(opts.root);
+  const rootDir = path.resolve(opts.root ?? process.cwd());
   const entryPath = resolveEntryPath(rootDir, opts.entry);
   const entryRelative = normalizeRelativePath(rootDir, entryPath);
   const packagePath = path.join(rootDir, "package.json");
@@ -328,8 +313,16 @@ export async function runPluginsBuildCommand(opts: PluginsBuildOptions): Promise
     return;
   }
 
-  writeJsonFile(packagePath, nextPackageManifest);
-  await writePluginBuildManifest(rootDir, manifest);
+  const realRootDir = fs.realpathSync(rootDir);
+  await replaceFileAtomic({
+    filePath: path.join(realRootDir, "package.json"),
+    content: `${JSON.stringify(nextPackageManifest, null, 2)}\n`,
+    preserveExistingMode: true,
+    dirMode: (await fs.promises.stat(realRootDir)).mode & 0o7777,
+    syncTempFile: true,
+    syncParentDir: true,
+  });
+  await writePluginBuildManifest(realRootDir, manifest);
   defaultRuntime.log(`Wrote ${formatOutputPath(manifestPath, PLUGIN_MANIFEST_FILENAME)}`);
   defaultRuntime.log(`Updated ${formatOutputPath(packagePath, "package.json")}`);
 }
@@ -337,7 +330,7 @@ export async function runPluginsBuildCommand(opts: PluginsBuildOptions): Promise
 export async function collectPluginsValidationResult(
   opts: PluginsValidateOptions,
 ): Promise<PluginsValidationResult> {
-  const rootDir = resolveRootDir(opts.root);
+  const rootDir = path.resolve(opts.root ?? process.cwd());
   const entryPath = resolveEntryPath(rootDir, opts.entry);
   const entryRelative = normalizeRelativePath(rootDir, entryPath);
   const packageManifest = readPackageManifest(rootDir);
@@ -375,10 +368,8 @@ export async function runPluginsValidateCommand(opts: PluginsValidateOptions): P
     if (!opts.json) {
       throw err;
     }
-    result = {
-      valid: false,
-      errors: [err instanceof Error ? err.message : String(err)],
-    };
+    const failure = err instanceof Error ? err : String(err);
+    result = { valid: false, errors: [formatCliOperatorError(failure)] };
   }
 
   if (!result.valid) {
@@ -400,16 +391,11 @@ export async function runPluginsValidateCommand(opts: PluginsValidateOptions): P
   defaultRuntime.log(`Plugin ${result.pluginId} is valid.`);
 }
 
-function assertCanCreate(filePath: string, force: boolean): void {
-  if (!force && fs.existsSync(filePath)) {
-    throw new Error(`Refusing to overwrite existing path: ${filePath}`);
-  }
-}
-
 function resolveScaffoldType(input: string | undefined): PluginScaffoldType {
   const type = input ?? "tool";
-  if (SUPPORTED_PLUGIN_SCAFFOLD_TYPES.includes(type as PluginScaffoldType)) {
-    return type as PluginScaffoldType;
+  const supported = SUPPORTED_PLUGIN_SCAFFOLD_TYPES.find((candidate) => candidate === type);
+  if (supported) {
+    return supported;
   }
   throw new Error(
     `Unsupported plugin scaffold type "${type}". Supported types: ${SUPPORTED_PLUGIN_SCAFFOLD_TYPES.join(
@@ -418,20 +404,12 @@ function resolveScaffoldType(input: string | undefined): PluginScaffoldType {
   );
 }
 
-function normalizeDisplayName(input: string): string {
-  const name = input.trim();
-  if (!name) {
-    throw new Error("Plugin display name is required.");
+function normalizeRequiredPluginText(input: string, label: string): string {
+  const value = input.trim();
+  if (!value) {
+    throw new Error(`Plugin ${label} is required.`);
   }
-  return name;
-}
-
-function normalizePluginId(input: string): string {
-  const id = input.trim();
-  if (!id) {
-    throw new Error("Plugin id is required.");
-  }
-  return id;
+  return value;
 }
 
 function titleFromId(id: string): string {
@@ -470,21 +448,6 @@ const createPluginPackageMetadata = (pluginApi: string) => ({
   build: { openclawVersion: VERSION },
 });
 
-function buildScaffoldTsconfig(type: PluginScaffoldType): JsonObject {
-  return {
-    compilerOptions: {
-      target: "ES2022",
-      module: "NodeNext",
-      moduleResolution: "NodeNext",
-      strict: true,
-      declaration: type === "tool",
-      outDir: "dist",
-      skipLibCheck: true,
-    },
-    include: type === "provider" ? ["src/index.ts"] : ["src/**/*.ts"],
-  };
-}
-
 function writeScaffoldVitestConfig(rootDir: string): void {
   fs.writeFileSync(
     path.join(rootDir, "vitest.config.ts"),
@@ -521,22 +484,20 @@ function writeToolPluginScaffold(params: { rootDir: string; id: string; name: st
     },
     devDependencies: {
       openclaw: "latest",
-      typescript: "^5.9.0",
+      typescript: "7.0.2",
       vitest: "^3.2.0",
     },
     openclaw: createPluginPackageMetadata(TOOL_PLUGIN_API_RANGE),
   };
-  const idLiteral = jsStringLiteral(params.id);
-  const nameLiteral = jsStringLiteral(params.name);
+  const idLiteral = JSON.stringify(params.id);
   const description = `Add ${params.name} tools to OpenClaw.`;
-  const descriptionLiteral = jsStringLiteral(description);
   const indexSource = `import { Type } from "typebox";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 
 export default defineToolPlugin({
   id: ${idLiteral},
-  name: ${nameLiteral},
-  description: ${descriptionLiteral},
+  name: ${JSON.stringify(params.name)},
+  description: ${JSON.stringify(description)},
   tools: (tool) => [
     tool({
       name: "echo",
@@ -618,7 +579,7 @@ function writeProviderPluginScaffold(params: { rootDir: string; id: string; name
     devDependencies: {
       clawhub: "latest",
       openclaw: "latest",
-      typescript: "^5.9.0",
+      typescript: "7.0.2",
       vitest: "^3.2.0",
     },
     openclaw: {
@@ -645,19 +606,11 @@ function writeProviderPluginScaffold(params: { rootDir: string; id: string; name
       },
     },
   };
-  const idLiteral = jsStringLiteral(params.id);
-  const nameLiteral = jsStringLiteral(params.name);
-  const envVarLiteral = jsStringLiteral(envVar);
-  const optionKeyLiteral = jsStringLiteral(optionKey);
-  const flagNameLiteral = jsStringLiteral(flagName);
-  const defaultModelIdLiteral = jsStringLiteral(defaultModelId);
-  const defaultModelRefLiteral = jsStringLiteral(defaultModelRef);
-  const descriptionLiteral = jsStringLiteral(description);
-  const apiKeyLabelLiteral = jsStringLiteral(`${params.name} API key`);
-  const promptMessageLiteral = jsStringLiteral(`Enter ${params.name} API key`);
-  const noteMessageLiteral = jsStringLiteral(
-    `Replace https://api.example.com/v1 with your ${params.name} API base URL.`,
-  );
+  const idLiteral = JSON.stringify(params.id);
+  const nameLiteral = JSON.stringify(params.name);
+  const envVarLiteral = JSON.stringify(envVar);
+  const defaultModelIdLiteral = JSON.stringify(defaultModelId);
+  const defaultModelRefLiteral = JSON.stringify(defaultModelRef);
   const indexSource = `import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth";
 
@@ -669,7 +622,7 @@ const DEFAULT_MODEL_REF = ${defaultModelRefLiteral};
 export default definePluginEntry({
   id: PLUGIN_ID,
   name: ${nameLiteral},
-  description: ${descriptionLiteral},
+  description: ${JSON.stringify(description)},
   register(api) {
     api.registerProvider({
       id: PROVIDER_ID,
@@ -680,16 +633,16 @@ export default definePluginEntry({
         createProviderApiKeyAuthMethod({
           providerId: PROVIDER_ID,
           methodId: "api-key",
-          label: ${apiKeyLabelLiteral},
+          label: ${JSON.stringify(`${params.name} API key`)},
           hint: "OpenAI-compatible API endpoint",
-          optionKey: ${optionKeyLiteral},
-          flagName: ${flagNameLiteral},
+          optionKey: ${JSON.stringify(optionKey)},
+          flagName: ${JSON.stringify(flagName)},
           envVar: ${envVarLiteral},
-          promptMessage: ${promptMessageLiteral},
+          promptMessage: ${JSON.stringify(`Enter ${params.name} API key`)},
           defaultModel: DEFAULT_MODEL_REF,
           expectedProviders: [PROVIDER_ID],
           noteTitle: ${nameLiteral},
-          noteMessage: ${noteMessageLiteral},
+          noteMessage: ${JSON.stringify(`Replace https://api.example.com/v1 with your ${params.name} API base URL.`)},
         }),
       ],
       catalog: {
@@ -759,8 +712,8 @@ describe(${idLiteral}, () => {
     ]);
     for (const [apiKey, configuredId, baseUrl, expectedBaseUrl] of [
       [undefined, ${idLiteral}, "https://configured.example/v1", null],
-      ["fixture-api-key", ${jsStringLiteral(`${params.id}-unrelated`)}, "https://unrelated.example/v1", "https://api.example.com/v1"],
-      ["fixture-api-key", ${jsStringLiteral(` ${params.id.toUpperCase()} `)}, " https://configured.example/v1 ", "https://configured.example/v1"],
+      ["fixture-api-key", ${JSON.stringify(`${params.id}-unrelated`)}, "https://unrelated.example/v1", "https://api.example.com/v1"],
+      ["fixture-api-key", ${JSON.stringify(` ${params.id.toUpperCase()} `)}, " https://configured.example/v1 ", "https://configured.example/v1"],
       ["fixture-api-key", ${idLiteral}, " ", "https://api.example.com/v1"],
     ] as const) {
       const result = await provider.catalog.run({
@@ -891,12 +844,13 @@ export async function runPluginsInitCommand(
   idInput: string,
   opts: PluginsInitOptions,
 ): Promise<void> {
-  const id = normalizePluginId(idInput);
-  const name = opts.name ? normalizeDisplayName(opts.name) : titleFromId(id);
+  const id = normalizeRequiredPluginText(idInput, "id");
+  const name = opts.name ? normalizeRequiredPluginText(opts.name, "display name") : titleFromId(id);
   const type = resolveScaffoldType(opts.type);
   const rootDir = path.resolve(opts.directory ?? id);
-  const force = opts.force === true;
-  assertCanCreate(rootDir, force);
+  if (opts.force !== true && fs.existsSync(rootDir)) {
+    throw new Error(`Refusing to overwrite existing path: ${rootDir}`);
+  }
   fs.mkdirSync(path.join(rootDir, "src"), { recursive: true });
   const tsconfig = buildScaffoldTsconfig(type);
 
