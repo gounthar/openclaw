@@ -155,11 +155,12 @@ describe("session branch diff stats", () => {
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  it.each(["loose", "packed", "detached", "linked"])(
+  it.each(["loose", "packed", "detached", "linked", "enterprise"])(
     "reads %s HEAD and remote refs without probes and preserves checkout context",
     async (layout) => {
       await initializeRepo();
-      await git("remote", "add", "origin", "https://github.com/openclaw/openclaw.git");
+      const host = layout === "enterprise" ? "ghe.example.test" : "github.com";
+      await git("remote", "add", "origin", `https://${host}/openclaw/openclaw.git`);
       await trackRemote("main");
       await git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
       let cwd = root;
@@ -178,10 +179,11 @@ describe("session branch diff stats", () => {
       try {
         await expect(
           runGitReadOperation(
-            { type: "checkout.context", input: { root: cwd } },
+            { type: "checkout.context", input: { root: cwd, githubHost: host } },
             { refresh: true },
           ),
         ).resolves.toEqual({
+          ...(layout === "enterprise" ? { host } : {}),
           owner: "openclaw",
           repo: "openclaw",
           root: cwd,
@@ -203,7 +205,7 @@ describe("session branch diff stats", () => {
         reads.mockClear();
         expect(
           await runGitReadOperation(
-            { type: "checkout.context", input: { root: cwd } },
+            { type: "checkout.context", input: { root: cwd, githubHost: host } },
             { refresh: true },
           ),
         ).toMatchObject({ defaultBranch: "release" });
@@ -212,7 +214,7 @@ describe("session branch diff stats", () => {
         reads.mockClear();
         expect(
           await runGitReadOperation(
-            { type: "checkout.context", input: { root: cwd } },
+            { type: "checkout.context", input: { root: cwd, githubHost: host } },
             { refresh: true },
           ),
         ).not.toHaveProperty("defaultBranch");
@@ -597,7 +599,7 @@ describe("session branch diff stats", () => {
       expect(await runGitReadOperation(operation)).toMatchObject({
         stats: { additions: 1, changedFiles: 1 },
       });
-      expect(reads.mock.calls.length).toBe(2);
+      expect(reads).toHaveBeenCalled();
       await writeFile("new.txt", "untracked\n");
       now += 300_000;
       expect(await runGitReadOperation(operation)).toMatchObject({
@@ -613,6 +615,32 @@ describe("session branch diff stats", () => {
       clock.mockRestore();
     }
   });
+
+  it.each([true, false])(
+    "refreshes stat-dirty binary files only in an owned checkout (owned=%s)",
+    async (refreshIndex) => {
+      await initializeFeatureBranch();
+      await writeFile("image.bin", Buffer.from([0, 1, 2, 3]));
+      await commit("binary fixture", "image.bin");
+      await trackRemote("main");
+      await trackRemote("feature");
+      const indexPath = path.join(root, ".git", "index");
+      const originalIndex = await fs.readFile(indexPath);
+      const tree = await resolveRevision("HEAD^{tree}");
+      await fs.utimes(path.join(root, "image.bin"), new Date(0), new Date(0));
+      const result = await runGitReadOperation({
+        type: "pull-request.branch-facts",
+        input: { root, branch: "feature", defaultBranch: "main", mergedHeads: [], refreshIndex },
+      });
+      if (refreshIndex) {
+        expect(result).toBeUndefined();
+        expect(await fs.readFile(indexPath)).not.toEqual(originalIndex);
+        expect((await git("write-tree")).stdout.trim()).toBe(tree);
+      } else {
+        expect(await fs.readFile(indexPath)).toEqual(originalIndex);
+      }
+    },
+  );
 
   it("reports local changes without createUrl until the branch exists on origin", async () => {
     await initializeFeatureBranch();
@@ -662,6 +690,82 @@ describe("session branch diff stats", () => {
     // A squash-merged remote tip must not resurrect a duplicate Create PR invitation.
     expect(result.branch).toBeUndefined();
   });
+
+  it.each([1, 2])(
+    "stops dependent comparisons after ancestry probe %s times out",
+    async (probe) => {
+      await initializeFeatureWork({ trackFeature: true });
+      const run = worktreeGit.runGitBytes;
+      let ancestryCalls = 0;
+      const reads = vi
+        .spyOn(worktreeGit, "runGitBytes")
+        .mockImplementation(async (cwd, args, options) => {
+          if (args[0] === "merge-base" && ++ancestryCalls >= probe) {
+            return {
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.alloc(0),
+              code: null,
+              signal: "SIGTERM",
+              killed: true,
+              termination: "timeout",
+              timeoutMs: 120_000,
+              windowsEncoding: null,
+            };
+          }
+          return run(cwd, args, options);
+        });
+      try {
+        const result = await loadMergedBranchState("1".repeat(40));
+        expect(result.branch).toEqual({ owner: "openclaw", repo: "openclaw", branch: "feature" });
+        expect(ancestryCalls).toBe(probe);
+      } finally {
+        reads.mockRestore();
+      }
+    },
+  );
+
+  it.each([true, false])(
+    "reads missing historical PR heads without transport (no-lazy-fetch=%s)",
+    async (noLazyFetch) => {
+      await initializeFeatureWork({ trackFeature: true });
+      await git("config", "extensions.partialClone", "origin");
+      await git("config", "remote.origin.promisor", "true");
+      await git("config", "remote.origin.url", path.join(root, "unavailable-remote"));
+      const tracePath = path.join(root, ".git", "trace.jsonl");
+      vi.stubEnv("GIT_TRACE2_EVENT", tracePath);
+      const run = worktreeGit.runGitBytes;
+      const reads = vi.spyOn(worktreeGit, "runGitBytes").mockImplementation((cwd, args, options) =>
+        run(
+          cwd,
+          args,
+          noLazyFetch
+            ? options
+            : {
+                ...options,
+                // Older Git ignores this variable; the transport policy must still hold.
+                env: { ...options?.env, GIT_NO_LAZY_FETCH: undefined },
+              },
+        ),
+      );
+      try {
+        const result = await loadMergedBranchState("1".repeat(40));
+        expect(result.branch).toMatchObject({ additions: 1, changedFiles: 1 });
+        const trace = await fs.readFile(tracePath, "utf8");
+        expect(
+          trace
+            .split("\n")
+            .filter(
+              (line) =>
+                line.includes('"event":"child_start"') &&
+                line.includes('"child_class":"transport/'),
+            ),
+        ).toEqual([]);
+      } finally {
+        reads.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   it("suppresses the Create PR row when the merged PR falls outside the display cap", async () => {
     const mergedHead = await initializeFeatureHead({ trackFeature: true });

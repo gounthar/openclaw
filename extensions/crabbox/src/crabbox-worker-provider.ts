@@ -7,12 +7,13 @@ import {
   type WorkerProvider,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { runCommandWithTimeout } from "openclaw/plugin-sdk/process-runtime";
+import { racePromiseWithAbortSignal } from "openclaw/plugin-sdk/time-runtime";
 import { resolveCrabboxBinary } from "./crabbox-binary.js";
 import { ensureManagedCrabboxBinary } from "./crabbox-managed-binary.js";
 import {
   type CrabboxCommandRunner,
   type LeaseCommandContext,
-  runCrabboxCommand,
+  runCrabboxCommandWithCoordinatorRetry,
   stopCrabboxLease,
 } from "./crabbox-worker-command.js";
 import { createCrabboxHeartbeatManager } from "./crabbox-worker-heartbeat.js";
@@ -104,7 +105,7 @@ export function createCrabboxWorkerProvider(
   const openclawRoot = dependencies.openclawRoot ?? process.cwd();
   const heartbeats = createCrabboxHeartbeatManager({
     run: (context, signal) =>
-      runCrabboxCommand({
+      runCrabboxCommandWithCoordinatorRetry({
         action: "heartbeat",
         args: [
           "heartbeat",
@@ -118,6 +119,7 @@ export function createCrabboxWorkerProvider(
         ],
         binary: context.binary,
         runCommand,
+        sleep,
         signal,
         timeoutMs: context.heartbeatTimeoutMs,
       }),
@@ -156,27 +158,11 @@ export function createCrabboxWorkerProvider(
         });
       binaries.set(candidate, resolution);
     }
-    let onAbort: (() => void) | undefined;
-    try {
-      const binary = signal
-        ? await Promise.race([
-            resolution,
-            new Promise<never>((_resolve, reject) => {
-              onAbort = () => reject(toErrorObject(signal.reason, "Crabbox acquisition aborted"));
-              signal.addEventListener("abort", onAbort, { once: true });
-              if (signal.aborted) {
-                onAbort();
-              }
-            }),
-          ])
-        : await resolution;
-      signal?.throwIfAborted();
-      return binary;
-    } finally {
-      if (onAbort) {
-        signal?.removeEventListener("abort", onAbort);
-      }
-    }
+    const binary = await racePromiseWithAbortSignal(resolution, signal, ({ reason }) =>
+      toErrorObject(reason, "Crabbox acquisition aborted"),
+    );
+    signal?.throwIfAborted();
+    return binary;
   };
   const machineOptions = createCrabboxMachineOptionsResolver({
     resolveBinary,
@@ -206,6 +192,7 @@ export function createCrabboxWorkerProvider(
       ...context,
       runCommand,
       warn,
+      sleep,
     });
     await warmImages.release(context);
   };
@@ -270,7 +257,7 @@ export function createCrabboxWorkerProvider(
     signal?.throwIfAborted();
     const binary = await resolveBinary(parsed.binary, preparationSignal);
     preparationSignal?.throwIfAborted();
-    const deadline = Date.now() + resolveCrabboxProvisionBaseTimeoutMs(parsed);
+    const deadline = performance.now() + resolveCrabboxProvisionBaseTimeoutMs(parsed);
     const nodeBootstrapTimeoutMs = resolveCrabboxNodeEnrollmentTimeoutMs(
       options?.nodeBootstrapTimeoutMs,
     );
@@ -318,6 +305,7 @@ export function createCrabboxWorkerProvider(
           ...context,
           id: leaseId,
           runCommand,
+          sleep,
           timeoutMs: remainingProvisionTimeout(
             deadline,
             resolveCrabboxLifecycleTimeoutMs(parsed.provider),
@@ -344,6 +332,7 @@ export function createCrabboxWorkerProvider(
         profile: parsed,
         runCommand,
         stopLease,
+        sleep,
         signal: preparationSignal,
       };
       if (isNonRunnableState(inspected.state)) {
@@ -700,6 +689,7 @@ export function createCrabboxWorkerProvider(
       const inspected = await inspectWithContext({
         ...context,
         runCommand,
+        sleep,
       });
       if (!inspected || isNonRunnableState(inspected.state)) {
         await heartbeats.stop(context.id);

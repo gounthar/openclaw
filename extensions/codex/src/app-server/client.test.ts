@@ -7,7 +7,7 @@ import {
   isCodexAppServerApprovalRequest,
   isCodexAppServerIndeterminateTransportError,
 } from "./client.js";
-import { resetSharedCodexAppServerClientForTests } from "./shared-client.js";
+import { resetSharedCodexAppServerClientForTests } from "./shared-client.test-support.js";
 import { createClientHarness } from "./test-support.js";
 import { CODEX_APP_SERVER_VERSION, MIN_SUPPORTED_CODEX_APP_SERVER_VERSION } from "./version.js";
 
@@ -343,7 +343,10 @@ describe("CodexAppServerClient", () => {
         },
       },
     );
-    const rejection = expect(request).rejects.toBe(ownershipError);
+    const rejection = expect(request).rejects.toMatchObject({
+      name: "CodexAppServerScopedRequestRejectedError",
+      cause: ownershipError,
+    });
     await vi.advanceTimersByTimeAsync(0);
     const first = JSON.parse(harness.writes[0] ?? "{}") as { id?: number };
     harness.send({

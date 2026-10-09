@@ -56,7 +56,7 @@ describe("Gateway GitHub publication boundaries", () => {
         database: openOpenClawStateDatabase(),
       });
       const requested = await placements.startDispatch(REQUEST);
-      placements.fail({
+      await placements.fail({
         sessionId: REQUEST.sessionId,
         expectedGeneration: requested.generation,
         recoveryError: "Provisioning stopped before allocation",
@@ -550,7 +550,7 @@ describe("Gateway GitHub publication boundaries", () => {
       id: "worktree-2",
       path: "/repo/other-worktree",
     };
-    insertRegistryWorktree(process.env, {
+    await insertRegistryWorktree(process.env, {
       ...otherWorktree,
       name: "other",
       createdAt: 1,

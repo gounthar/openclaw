@@ -114,6 +114,36 @@ the next Plugin SDK major. See the [migration table](/plugins/sdk-migration/how-
 for every replacement, return value, and the additive extension and provider
 replay APIs. Transcript formats, schemas, and update behavior are unchanged.
 
+## Native assistant persistence
+
+Assistant producers should reuse the committed row's `idempotencyKey` as the
+live `assistant` event's `itemId`. The Gateway retires that exact occurrence
+when its run-owned commit is published, including corrections that arrive
+after persistence. Separate occurrences need separate identities even when
+their text is identical.
+
+Native harnesses that publish committed assistant rows with
+`publishSessionTranscriptUpdateByIdentity` from
+`openclaw/plugin-sdk/session-transcript-runtime` can include
+`update.assistantItemIds`. These are the exact `assistant` stream item IDs whose
+live display the committed row replaces or supersedes. Capture the IDs before
+awaiting persistence, and publish only after the row commits or an exact
+idempotent persistence receipt confirms it. An empty array still identifies a
+native row with no preceding streamed item. The persisted row's existing
+idempotency key also identifies a later canonical assistant frame.
+
+This field is display provenance, not terminal or run authorization. Existing
+session and run ownership checks still apply. It is internal to the host's
+transcript notification path: do not put it in the persisted message or public
+gateway events. Independently owned keyed commentary and async rows omit it.
+When steering commits a completed item, include only that item's ID; a later
+unfinished item remains live even if its text repeats the committed row.
+
+The Gateway does not infer ownership from text. An unkeyed producer's text
+stays in the live tail until an identity-bearing commit can own it or the run
+terminates. Such a producer can temporarily show a duplicate durable row;
+the Gateway favors preserving unsaved text over guessing which occurrence to hide.
+
 ## Bounded model context
 
 Use `await SessionManager.openModelContextAsync(...)` from
@@ -361,6 +391,22 @@ Catalog list publishers use `createSessionCatalogSourceActorProjector({ pluginId
     ```
 
   </Accordion>
+  <Accordion title="api.runtime.worktrees">
+    Managed worktree creation, release, and lossless removal retain the selected
+    state root's ownership through their Git and registry effects. Calls inside
+    the owning Gateway stay in-process. When no process owns the state, these
+    methods acquire exclusive offline custody and release it after accepted
+    work settles.
+
+    A foreign live Gateway or embedded owner rejects these mutations with
+    `code: "OWNER_UNAVAILABLE"` before local effects. Run the plugin operation
+    inside the owning Gateway, or stop the Gateway through its service owner
+    and wait for embedded runs to finish before retrying offline. The SDK's
+    synchronous commit guard for `create` remains local and cannot cross RPC.
+    Checkout-root and metadata inspection remain read-only. Method signatures
+    are unchanged; no migration is required.
+
+  </Accordion>
   <Accordion title="api.runtime.sandbox">
     Inspect the effective sandbox workspace authority for an agent session.
 
@@ -392,6 +438,28 @@ Catalog list publishers use `createSessionCatalogSourceActorProjector({ pluginId
     whose live config hash does not match the requested mounts or policy. Pass
     only exact tool names whose registered implementations the calling plugin
     confines; wildcard prefixes do not prove tool ownership.
+
+    Sandbox workspace preparation checks the selected state root's live owner.
+    This applies to
+    `prepareWorkspaceAuthority(...)` and `resolveSandboxContext(...)` from
+    `openclaw/plugin-sdk/agent-harness-runtime`. Disabled sandbox resolution stays
+    a no-op, and read-only session classification remains available in foreign
+    processes. When sandboxing is enabled, a foreign live Gateway or embedded
+    owner causes `code: "GATEWAY_STATE_OWNER_REQUIRED"` before sandbox workspace,
+    registry, or projection mutation. Run the call inside the owning Gateway
+    plugin/runtime, or stop the Gateway and wait for embedded runs to finish,
+    then retry offline.
+
+    Calls hosted by the current Gateway or embedded owner stay in-process.
+    Preparation rechecks captured custody before workspace setup and backend
+    provisioning. Losing that custody rejects with `GATEWAY_STATE_OWNER_REQUIRED`;
+    built-in container backends also retain the check across provisioning awaits.
+    Standalone SDK callers also stay local when no live owner exists. Preparation
+    does not acquire a temporary lock or forward permission callbacks over RPC;
+    it does not prevent another owner from starting after offline admission.
+    Released parameters and return types are unchanged. Older SDK binaries and
+    other state roots remain outside this same-root gate; database freshness
+    checks still apply. No migration or update step is required.
 
   </Accordion>
 </AccordionGroup>

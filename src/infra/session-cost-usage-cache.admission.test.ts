@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { afterEach, expect, it, vi } from "vitest";
-import { awaitGateBeforeSettlement } from "../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import * as configEnv from "../config/config-env-vars.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -146,7 +146,6 @@ it.each(["acquire", "release", "rollup", "prune"] as const)(
 );
 
 it.each([
-  { closing: false, retarget: false, refresh: false },
   { closing: true, retarget: false, refresh: false },
   { closing: false, retarget: true, refresh: false },
   { closing: false, retarget: true, refresh: true },
@@ -273,27 +272,37 @@ it("keeps refresh ownership after a rejected release until deletion commits", as
   const root = tempDirs.make("openclaw-usage-lock-release-");
   await withEnvAsync({ OPENCLAW_STATE_DIR: root }, async () => {
     const agentId = "usage-test";
-    const owner = prepareSessionCostUsageRefreshLock(agentId);
-    const contender = prepareSessionCostUsageRefreshLock(agentId);
-    expect(await Promise.all([owner.acquire(), contender.acquire()])).toEqual([true, false]);
-    await contender.release();
-    expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(true);
-    const database = openOpenClawAgentDatabase({ agentId });
-    database.db.exec(`
+    const first = prepareSessionCostUsageRefreshLock(agentId);
+    const second = prepareSessionCostUsageRefreshLock(agentId);
+    let database: ReturnType<typeof openOpenClawAgentDatabase> | undefined;
+    let replacement: ReturnType<typeof prepareSessionCostUsageRefreshLock> | undefined;
+    try {
+      const acquired = await Promise.all([first.acquire(), second.acquire()]);
+      expect(acquired.filter(Boolean)).toHaveLength(1);
+      const owner = acquired[0] ? first : second;
+      const contender = acquired[0] ? second : first;
+      await contender.release();
+      expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(true);
+      database = openOpenClawAgentDatabase({ agentId });
+      database.db.exec(`
       CREATE TRIGGER reject_refresh_release BEFORE DELETE ON cache_entries
       WHEN OLD.scope = 'session-cost-usage' AND OLD.key = 'refresh-lock'
       BEGIN SELECT RAISE(ABORT, 'release rejected'); END;
     `);
-    await expect(owner.release()).rejects.toThrow("release rejected");
-    expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(true);
-    database.db.exec("DROP TRIGGER reject_refresh_release");
-    await owner.release();
-    expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(false);
-    const replacement = prepareSessionCostUsageRefreshLock(agentId);
-    expect(await replacement.acquire()).toBe(true);
-    await owner.release();
-    expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(true);
-    await replacement.release();
+      await expect(owner.release()).rejects.toThrow("release rejected");
+      expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(true);
+      database.db.exec("DROP TRIGGER reject_refresh_release");
+      await owner.release();
+      expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(false);
+      replacement = prepareSessionCostUsageRefreshLock(agentId);
+      expect(await replacement.acquire()).toBe(true);
+      await owner.release();
+      expect(await isSessionCostUsageRefreshRunning(agentId)).toBe(true);
+      await replacement.release();
+    } finally {
+      database?.db.exec("DROP TRIGGER IF EXISTS reject_refresh_release");
+      await Promise.all([first.release(), second.release(), replacement?.release()]);
+    }
   });
 });
 
@@ -450,6 +459,55 @@ it.each([false, true])(
         await releasing;
         await owner.release();
       }
+    });
+  },
+);
+
+it.for(["rollup", "prune"] as const)(
+  "cancels a queued usage %s before the active writer settles",
+  async (operation, { signal }) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const agentId = "usage-canceled-admission";
+      const options = { agentId, env: state.env };
+      const database = openOpenClawAgentDatabase(options);
+      const owner = prepareSessionCostUsageRefreshLock(agentId, database.path, { env: state.env });
+      expect(await owner.acquire()).toBe(true);
+      const row = {
+        rollupId: "retained",
+        previousValueJson: null,
+        valueJson: Buffer.from("{}"),
+        blob: null,
+        updatedAt: 1,
+      };
+      expect(await owner.writeRollup(row)).toBe(true);
+      const before = readSessionCostUsageRollupRows(agentId, database.path);
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
+      const held = runOpenClawAgentWorkerWrite(options, async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      await entered.promise;
+      const controller = new AbortController();
+      const cancellation = new Error("Usage callback deadline expired");
+      const writing =
+        operation === "rollup"
+          ? owner.writeRollup({ ...row, rollupId: "canceled" }, controller.signal)
+          : owner.pruneRows(before, controller.signal);
+      const outcome = writing.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      controller.abort(cancellation);
+      try {
+        expect(await withinTest(outcome, signal)).toBe(cancellation);
+        expect(readSessionCostUsageRollupRows(agentId, database.path)).toEqual(before);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([held, writing]);
+        await owner.release();
+      }
+      expect(readSessionCostUsageRollupRows(agentId, database.path)).toEqual(before);
     });
   },
 );

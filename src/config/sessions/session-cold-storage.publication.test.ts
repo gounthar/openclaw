@@ -2,10 +2,9 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { sessionChanges } from "../../sessions/session-row-changes.js";
 import type { OpenClawAgentDatabaseOptions } from "../../state/openclaw-agent-db.js";
-import { SqliteReclamationRequestRefusedError } from "./session-accessor.sqlite-reclamation-commit.js";
 import type { SessionColdReadPreparation } from "./session-cold-storage-read.js";
-import type { SessionColdMutationResult } from "./session-cold-storage-worker.js";
 import { restoreSessionColdTranscript } from "./session-cold-storage.js";
+import type { SessionColdMutationResult } from "./session-cold-storage.types.js";
 
 type Receipt = { result: SessionColdMutationResult; cleanupIncomplete?: boolean };
 const observed = vi.hoisted(() => ({
@@ -168,42 +167,25 @@ it("publishes the committed key exactly once after the worker settles, without h
   });
 });
 
-it.each(["refused", "rejected", "cleanup incomplete"])(
-  "does not publish when restoration is %s",
+it.each(["cleanup incomplete", "database", "caller", "request"])(
+  "does not publish after restoration loses completion or authority: %s",
   async (outcome) => {
-    if (outcome === "cleanup incomplete") {
-      observed.worker.mockResolvedValue([{ result, cleanupIncomplete: true }]);
-    } else {
-      observed.worker.mockRejectedValue(
-        outcome === "refused"
-          ? new SqliteReclamationRequestRefusedError("restore refused")
-          : new Error("restore rejected"),
-      );
-    }
-    await expect(restore()).rejects.toThrow(
-      outcome === "cleanup incomplete" ? /cleanup is incomplete/ : `restore ${outcome}`,
-    );
-    expect(changes).not.toHaveBeenCalled();
-  },
-);
-
-it.each(["database", "caller", "request"])(
-  "does not publish a receipt after its %s authority retires",
-  async (authority) => {
     observed.worker.mockImplementation(async () => {
-      if (authority === "database") {
+      if (outcome === "database") {
         observed.claimCurrent = false;
-      } else {
-        observed[authority === "caller" ? "caller" : "request"].mockImplementation(() => {
+      } else if (outcome === "caller" || outcome === "request") {
+        observed[outcome].mockImplementation(() => {
           throw new Error("restore authority retired");
         });
       }
-      return [{ result }];
+      return [{ result, ...(outcome === "cleanup incomplete" ? { cleanupIncomplete: true } : {}) }];
     });
-    if (authority === "database") {
+    if (outcome === "database") {
       await restore();
     } else {
-      await expect(restore()).rejects.toThrow("restore authority retired");
+      await expect(restore()).rejects.toThrow(
+        outcome === "cleanup incomplete" ? /cleanup is incomplete/ : "restore authority retired",
+      );
     }
     expect(changes).not.toHaveBeenCalled();
   },

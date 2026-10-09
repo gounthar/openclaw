@@ -12,8 +12,9 @@ import type { ConversationRouteContext } from "./conversation-route-context.js";
 import { retainLegacyAcpMigrationSourcesForEntry } from "./session-accessor.sqlite-acp-provenance.js";
 import {
   linkSessionConversation,
+  prepareConversationIdentities,
   prepareSessionConversationForWrite,
-  upsertConversationIdentity,
+  upsertConversationIdentities,
 } from "./session-accessor.sqlite-conversation.js";
 import { commitSqliteSessionDeletion } from "./session-accessor.sqlite-deletion.js";
 import {
@@ -21,10 +22,7 @@ import {
   trackSessionEntryCacheWrite,
 } from "./session-accessor.sqlite-entry-cache.js";
 import { sessionSharingEntriesEqual } from "./session-accessor.sqlite-entry-cache.types.js";
-import {
-  sqliteSessionEntriesEqual,
-  type SqliteLifecycleTargetSnapshot,
-} from "./session-accessor.sqlite-entry-equality.js";
+import type { SqliteLifecycleTargetSnapshot } from "./session-accessor.sqlite-entry-equality.js";
 import {
   readExactSessionEntryRow,
   readSessionEntryTargetRow,
@@ -75,7 +73,6 @@ import {
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 export {
   parseReadableSqliteSessionEntryRow,
-  parseReadableSqliteSessionEntryRows,
   readExactSessionEntryRow,
   readExactSessionEntryRowValidated,
   readSessionEntryRow,
@@ -351,20 +348,6 @@ export function deleteLifecycleTargetRows(
   }
 }
 
-export function assertLifecycleTargetUnchanged(
-  database: OpenClawAgentDatabase,
-  target: { canonicalKey: string; storeKeys: string[] },
-  expectedEntry: SessionEntry | undefined,
-  operation: "deleted" | "reset",
-): void {
-  if (
-    sqliteSessionEntriesEqual(resolveLifecyclePrimaryEntry(database, target)?.entry, expectedEntry)
-  ) {
-    return;
-  }
-  throw new Error(`SQLite session entry changed before ${operation} lifecycle mutation`);
-}
-
 export function deleteLegacySessionEntryRows(
   database: OpenClawAgentDatabase,
   legacyKeys: string[],
@@ -570,7 +553,11 @@ export function writeSessionEntry(
     sessionScope: boundSessionRoot.session_scope,
   });
   if (conversation) {
-    upsertConversationIdentity(database, conversation.identity, updatedAt);
+    upsertConversationIdentities(
+      database,
+      prepareConversationIdentities([conversation.identity]),
+      updatedAt,
+    );
   }
   const boundSessionRow = {
     ...boundSessionRoot,
